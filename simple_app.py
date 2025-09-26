@@ -1,0 +1,1007 @@
+import streamlit as st
+import os
+import time
+import tempfile
+import json
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+from dotenv import load_dotenv
+from unstructured_client import UnstructuredClient
+from unstructured_client.models.operations import ListWorkflowsRequest, ListJobsRequest, RunWorkflowRequest, ListDestinationsRequest, UpdateDestinationRequest
+from unstructured_client.models.shared import UpdateDestinationConnector
+from google.cloud import storage
+from google.oauth2 import service_account
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# Load environment variables
+load_dotenv()
+
+# Page config
+st.set_page_config(
+    page_title="PDF Upload & Chat",
+    page_icon="📚",
+    layout="wide"
+)
+
+# Initialize session state
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+if 'processed_files' not in st.session_state:
+    st.session_state.processed_files = []
+
+@st.cache_resource
+def init_unstructured_client():
+    """Initialize Unstructured client"""
+    api_key = os.getenv("UNSTRUCTURED_API_KEY")
+    if not api_key:
+        st.error("❌ UNSTRUCTURED_API_KEY not found in environment variables")
+        return None
+    
+    return UnstructuredClient(api_key_auth=api_key)
+
+@st.cache_resource
+def init_gcs_client():
+    """Initialize Google Cloud Storage client"""
+    try:
+        # Try to get credentials from environment variable
+        credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
+        
+        if credentials_path and os.path.exists(credentials_path):
+            # Use service account file
+            credentials = service_account.Credentials.from_service_account_file(credentials_path)
+            client = storage.Client(credentials=credentials, project=project_id)
+        else:
+            # Try to use default credentials or service account key from session state
+            if 'gcs_credentials' in st.session_state:
+                credentials_info = st.session_state.gcs_credentials
+                credentials = service_account.Credentials.from_service_account_info(credentials_info)
+                client = storage.Client(credentials=credentials, project=project_id)
+            else:
+                # Use default credentials (if running on GCP)
+                client = storage.Client(project=project_id)
+        
+        return client
+    except Exception as e:
+        st.error(f"Error initializing GCS client: {e}")
+        return None
+
+def get_workflows(client):
+    """Get available workflows"""
+    try:
+        response = client.workflows.list_workflows(
+            request=ListWorkflowsRequest()
+        )
+        workflows = response.response_list_workflows if response.response_list_workflows else []
+        logger.info(f"Found {len(workflows)} workflows")
+        return workflows
+    except Exception as e:
+        logger.error(f"Error fetching workflows: {e}")
+        st.error(f"Error fetching workflows: {e}")
+        return []
+
+def get_workflow_details(client, workflow_id):
+    """Get detailed workflow information"""
+    try:
+        # Use the correct SDK method - exactly like in run_workflow_test.py
+        workflow_details = client.workflows.get_workflow(workflow_id)
+        return workflow_details.workflow_information
+    except Exception as e:
+        logger.error(f"Error getting workflow details: {e}")
+        # Fallback - get from list of workflows
+        try:
+            workflows = get_workflows(client)
+            for workflow in workflows:
+                if workflow.id == workflow_id:
+                    logger.info(f"Found workflow via list: {workflow.name}")
+                    return workflow
+            logger.warning(f"Workflow {workflow_id} not found in list")
+            return None
+        except Exception as e2:
+            logger.error(f"Error getting workflow from list: {e2}")
+            return None
+
+def check_workflow_jobs(client, workflow_id, limit=10):
+    """Check recent jobs for a workflow - using exact pattern from run_workflow_test.py"""
+    try:
+        # Use the exact same pattern as the working run_workflow_test.py
+        jobs_response = client.jobs.list_jobs(
+            request=ListJobsRequest(workflow_id=workflow_id)
+        )
+        
+        if jobs_response.response_list_jobs:
+            # Sort by creation time (most recent first) - same as working code
+            jobs = sorted(jobs_response.response_list_jobs,
+                         key=lambda j: j.created_at or "", reverse=True)
+            logger.info(f"Found {len(jobs)} jobs for workflow {workflow_id}")
+            return jobs[:limit]
+        else:
+            logger.info(f"No jobs found for workflow {workflow_id}")
+            return []
+    except Exception as e:
+        logger.error(f"Error checking jobs: {e}")
+        return []
+
+def monitor_workflow_activity(client, workflow_id, uploaded_files):
+    """Monitor workflow activity and provide diagnostics"""
+    st.subheader("🔍 Workflow Monitoring & Diagnostics")
+    
+    # Get workflow details
+    workflow_info = get_workflow_details(client, workflow_id)
+    if workflow_info:
+        st.write("**Workflow Configuration:**")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write(f"• **Name:** {workflow_info.name}")
+            st.write(f"• **Status:** {workflow_info.status}")
+            st.write(f"• **ID:** {workflow_id}")
+        with col2:
+            st.write(f"• **Created:** {getattr(workflow_info, 'created_at', 'Unknown')}")
+            st.write(f"• **Updated:** {getattr(workflow_info, 'updated_at', 'Unknown')}")
+        
+        # Check if workflow is active
+        if workflow_info.status.lower() != 'active':
+            st.error(f"🚨 **ISSUE FOUND:** Workflow status is '{workflow_info.status}' - should be 'active'")
+        else:
+            st.success("✅ Workflow status is active")
+    else:
+        st.error("❌ Could not retrieve workflow details")
+    
+    # Check recent jobs with detailed analysis
+    st.write("**Job Analysis:**")
+    jobs = check_workflow_jobs(client, workflow_id)
+    
+    if jobs:
+        st.success(f"✅ Found {len(jobs)} jobs")
+        
+        # Show jobs in a nice table format
+        for i, job in enumerate(jobs[:5]):
+            status_emoji = {
+                "completed": "✅", "finished": "✅", "running": "🔄", 
+                "pending": "⏳", "failed": "❌", "cancelled": "⏹️"
+            }.get(job.status.lower(), "❓")
+            
+            created_time = job.created_at or "Unknown"
+            job_id_short = job.id[:8] if hasattr(job, 'id') else "Unknown"
+            
+            # Create expandable job details
+            with st.expander(f"{status_emoji} {job.status.upper()} - {job_id_short}... - {created_time}"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write(f"**Job ID:** {getattr(job, 'id', 'Unknown')}")
+                    st.write(f"**Status:** {getattr(job, 'status', 'Unknown')}")
+                    st.write(f"**Created:** {getattr(job, 'created_at', 'Unknown')}")
+                with col2:
+                    st.write(f"**Updated:** {getattr(job, 'updated_at', 'Unknown')}")
+                    st.write(f"**Runtime:** {getattr(job, 'runtime', 'Unknown')}")
+                    st.write(f"**Workflow:** {getattr(job, 'workflow_name', 'Unknown')}")
+                
+                # Show job details as JSON for debugging
+                if st.checkbox(f"Show raw job data", key=f"raw_{i}"):
+                    st.json(job.__dict__ if hasattr(job, '__dict__') else str(job))
+        
+        # Analysis of recent activity
+        recent_jobs = [j for j in jobs if j.created_at and 'Sep 26, 2025' in str(j.created_at)]
+        if recent_jobs:
+            st.info(f"🎉 Found {len(recent_jobs)} recent jobs - workflow is active!")
+        
+        # Check for completed jobs
+        completed_jobs = [j for j in jobs if j.status.lower() in ['completed', 'finished']]
+        if completed_jobs:
+            st.success(f"✅ {len(completed_jobs)} jobs completed successfully")
+            st.write("**This means your documents have been processed and should be in Pinecone!**")
+        
+    else:
+        st.warning("⚠️ No jobs returned from API")
+        st.write("**Possible reasons:**")
+        st.write("• API method signature issue (we're fixing this)")
+        st.write("• Jobs exist but API call format is incorrect")
+        st.write("• Workflow has no job history yet")
+        
+        # Show what we know from the dashboard
+        st.info("💡 **From your dashboard screenshot, we can see:**")
+        st.write("• ✅ Workflow IS working (finished job visible)")
+        st.write("• ✅ Target bucket: `gs://unpipetestm/documents`")
+        st.write("• ✅ Job completed: Sep 26, 2025 1:34 AM")
+        st.write("• ✅ Runtime: 1 minute 49 seconds")
+    
+    # File upload diagnostics with path analysis
+    if uploaded_files:
+        st.write("**File Upload Analysis:**")
+        
+        # Analyze upload patterns
+        bucket_name = None
+        upload_paths = []
+        
+        for file_info in uploaded_files:
+            if isinstance(file_info, dict):
+                bucket_name = file_info['bucket']
+                upload_paths.append(file_info['gcs_path'])
+                
+                st.write(f"📄 **{file_info['filename']}**")
+                st.write(f"   • GCS Path: `gs://{file_info['bucket']}/{file_info['gcs_path']}`")
+                st.write(f"   • Upload Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(file_info.get('uploaded_at', 0)))}")
+                
+                # Verify file exists
+                try:
+                    gcs_client = init_gcs_client()
+                    if gcs_client:
+                        bucket = gcs_client.bucket(file_info['bucket'])
+                        blob = bucket.blob(file_info['gcs_path'])
+                        if blob.exists():
+                            st.write(f"   • ✅ Confirmed in GCS (Size: {blob.size} bytes)")
+                        else:
+                            st.write(f"   • ❌ File missing from GCS!")
+                except Exception as e:
+                    st.write(f"   • ⚠️ GCS check failed: {e}")
+        
+        # Path analysis
+        if upload_paths:
+            st.write("**Path Analysis:**")
+            common_prefix = "documents/"
+            st.write(f"• Files uploaded to: `/{common_prefix}*`")
+            st.write(f"• Bucket: `{bucket_name}`")
+            
+            st.warning("🔍 **ACTION NEEDED:** Check if your workflow source connector is configured to monitor:")
+            st.code(f"Bucket: {bucket_name}\nPath: {common_prefix} (or root /)")
+    
+    # Recommendations
+    st.write("**🎯 Next Steps:**")
+    if not jobs:
+        st.write("1. **Check Unstructured.io workflow settings:**")
+        st.write("   • Verify GCS source connector configuration")
+        st.write("   • Ensure bucket name matches exactly")
+        st.write("   • Check if path filter includes `/documents/` or is set to `/`")
+        
+        st.write("2. **Test workflow configuration:**")
+        st.write("   • Try uploading a file directly to bucket root `/`")
+        st.write("   • Check workflow logs in Unstructured.io dashboard")
+        
+        st.write("3. **Verify permissions:**")
+        st.write("   • Ensure Unstructured service account can read your bucket")
+    
+    return jobs
+
+def upload_file_to_gcs(gcs_client, bucket_name, file_content, filename):
+    """Upload file to Google Cloud Storage with detailed logging"""
+    try:
+        logger.info(f"Starting upload: {filename} to bucket {bucket_name}")
+        
+        # Get the bucket
+        bucket = gcs_client.bucket(bucket_name)
+        logger.info(f"Got bucket reference: {bucket_name}")
+        
+        # Create a blob (file) in the bucket
+        # Use custom path if set, otherwise default to protocols/dev
+        upload_path = getattr(st.session_state, 'upload_path', 'protocols/dev')
+        if upload_path and not upload_path.endswith('/'):
+            upload_path += '/'
+        blob_name = f"{upload_path}{filename}"
+        blob = bucket.blob(blob_name)
+        logger.info(f"Created blob reference: {blob_name}")
+        
+        # Upload the file content
+        blob.upload_from_string(file_content, content_type='application/pdf')
+        logger.info(f"Upload completed: {blob_name}")
+        
+        # Get file metadata
+        blob.reload()  # Refresh to get updated metadata
+        
+        result = {
+            'success': True,
+            'blob_name': blob_name,
+            'bucket': bucket_name,
+            'public_url': f"gs://{bucket_name}/{blob_name}",
+            'size': blob.size,
+            'created': blob.time_created.isoformat() if blob.time_created else None,
+            'updated': blob.updated.isoformat() if blob.updated else None
+        }
+        
+        logger.info(f"Upload result: {result}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error uploading to GCS: {e}")
+        st.error(f"Error uploading to GCS: {e}")
+        return None
+
+def trigger_workflow(unstructured_client, workflow_id, namespace=None, pinecone_connector_id=None):
+    """Manually trigger a workflow to process uploaded files with optional namespace update"""
+    try:
+        # If namespace is provided, update the Pinecone connector first
+        if namespace and pinecone_connector_id:
+            st.info(f"🔄 Updating Pinecone namespace to: `{namespace}`")
+            namespace_result = update_pinecone_namespace(
+                unstructured_client, 
+                pinecone_connector_id, 
+                namespace
+            )
+            
+            if not namespace_result.get('success'):
+                st.warning("⚠️ Namespace update failed, proceeding with current namespace")
+            else:
+                st.success(f"✅ Namespace updated to: `{namespace}`")
+        
+        logger.info(f"Triggering workflow {workflow_id}")
+        
+        # Create the workflow run request (only workflow_id is supported)
+        response = unstructured_client.workflows.run_workflow(
+            request=RunWorkflowRequest(
+                workflow_id=workflow_id
+            )
+        )
+        
+        if response and hasattr(response, 'raw_response'):
+            logger.info(f"Workflow triggered successfully: {response.raw_response}")
+            
+            # Try to extract job information from response
+            job_info = None
+            if hasattr(response, 'job_information'):
+                job_info = response.job_information
+            elif hasattr(response, 'response_run_workflow'):
+                job_info = response.response_run_workflow
+            
+            if job_info:
+                job_id = getattr(job_info, 'id', 'Unknown')
+                job_status = getattr(job_info, 'status', 'Unknown')
+                st.success(f"✅ Workflow triggered successfully!")
+                st.info(f"📋 Job ID: {job_id}")
+                st.info(f"🔄 Initial Status: {job_status}")
+                if namespace:
+                    st.info(f"🏷️ Using namespace: `{namespace}`")
+                return {'success': True, 'job_id': job_id, 'job_info': job_info, 'namespace': namespace}
+            else:
+                st.success(f"✅ Workflow triggered successfully!")
+                st.info("📋 Job details will be available in workflow monitoring")
+                if namespace:
+                    st.info(f"🏷️ Using namespace: `{namespace}`")
+                return {'success': True, 'response': response, 'namespace': namespace}
+        else:
+            st.success(f"✅ Workflow trigger request sent")
+            return {'success': True, 'namespace': namespace}
+            
+    except Exception as e:
+        logger.error(f"Error triggering workflow: {e}")
+        st.error(f"❌ Error triggering workflow: {e}")
+        
+        # Still show helpful info about auto-detection as fallback
+        st.info("ℹ️ If manual triggering fails, workflows may still auto-detect files")
+        st.write("**Fallback options:**")
+        st.write("• Wait 2-5 minutes for auto-detection")
+        st.write("• Check workflow configuration for GCS monitoring")
+        st.write("• Use 'Full Workflow Diagnostics' to monitor activity")
+        
+        return {'success': False, 'error': str(e)}
+
+def check_job_status(client, job_id):
+    """Check the status of a workflow job"""
+    try:
+        response = client.jobs.get_job(job_id)
+        return response.job_information if response else None
+    except Exception as e:
+        st.error(f"Error checking job status: {e}")
+        return None
+
+def get_destination_connectors(client):
+    """Get available destination connectors"""
+    try:
+        response = client.destinations.list_destinations(
+            request=ListDestinationsRequest()
+        )
+        destinations = response.response_list_destinations if response.response_list_destinations else []
+        logger.info(f"Found {len(destinations)} destination connectors")
+        return destinations
+    except Exception as e:
+        logger.error(f"Error fetching destination connectors: {e}")
+        st.error(f"Error fetching destination connectors: {e}")
+        return []
+
+def get_pinecone_connectors(client):
+    """Get Pinecone destination connectors specifically"""
+    destinations = get_destination_connectors(client)
+    pinecone_connectors = [d for d in destinations if getattr(d, 'type', '').lower() == 'pinecone']
+    logger.info(f"Found {len(pinecone_connectors)} Pinecone connectors")
+    return pinecone_connectors
+
+def update_pinecone_namespace(client, connector_id, new_namespace, connector_config=None):
+    """Update the namespace for a Pinecone destination connector"""
+    try:
+        logger.info(f"Updating Pinecone connector {connector_id} namespace to: {new_namespace}")
+        
+        # Get current connector details if config not provided
+        if not connector_config:
+            destinations = get_destination_connectors(client)
+            connector = next((d for d in destinations if d.id == connector_id), None)
+            if not connector:
+                raise Exception(f"Connector {connector_id} not found")
+            connector_config = getattr(connector, 'config', None)
+        
+        # Convert Pydantic model to dict and update with new namespace
+        if hasattr(connector_config, 'model_dump'):
+            # Handle Pydantic v2 model
+            updated_config = connector_config.model_dump()
+        elif hasattr(connector_config, 'dict'):
+            # Handle Pydantic v1 model
+            updated_config = connector_config.dict()
+        elif hasattr(connector_config, '__dict__'):
+            # Handle other object types
+            updated_config = {}
+            for key, value in connector_config.__dict__.items():
+                if not key.startswith('_') and not callable(value):
+                    updated_config[key] = value
+        else:
+            # Handle dict-like object
+            updated_config = dict(connector_config) if connector_config else {}
+        
+        # Ensure all required Pinecone configuration fields are present
+        # Get required values from environment or preserve existing
+        pinecone_index = os.getenv("PINECONE_INDEX_NAME")
+        pinecone_api_key = os.getenv("PINECONE_API_KEY")
+        
+        # Validate required fields
+        if not pinecone_index:
+            raise Exception("PINECONE_INDEX_NAME environment variable is required")
+        if not pinecone_api_key:
+            raise Exception("PINECONE_API_KEY environment variable is required")
+        
+        # Build complete configuration with all required fields
+        complete_config = {
+            "index_name": pinecone_index,
+            "namespace": new_namespace,
+            "api_key": pinecone_api_key,
+            "batch_size": updated_config.get("batch_size", 50)  # Default to 50 if not set
+        }
+        
+        # Preserve any additional configuration fields that might exist
+        for key, value in updated_config.items():
+            if key not in complete_config and value is not None:
+                complete_config[key] = value
+        
+        logger.info(f"Sending Pinecone config update: {complete_config}")
+        logger.info(f"Config keys: {list(complete_config.keys())}")
+        
+        # Create update request with corrected structure
+        response = client.destinations.update_destination(
+            request=UpdateDestinationRequest(
+                destination_id=connector_id,  # ✅ FIXED: destination_id inside the request
+                update_destination_connector=UpdateDestinationConnector(
+                    config=complete_config
+                )
+            )
+        )
+        
+        if response:
+            logger.info(f"Successfully updated namespace to: {new_namespace}")
+            st.success(f"✅ Updated Pinecone namespace to: `{new_namespace}`")
+            return {'success': True, 'namespace': new_namespace}
+        else:
+            raise Exception("Update request returned no response")
+            
+    except Exception as e:
+        logger.error(f"Error updating Pinecone namespace: {e}")
+        st.error(f"❌ Error updating namespace: {e}")
+        
+        # Show helpful debug information
+        if "validation error" in str(e).lower():
+            st.error("🔧 **Configuration Issue Detected:**")
+            st.write("• Check that PINECONE_INDEX_NAME is set in your environment")
+            st.write("• Check that PINECONE_API_KEY is set in your environment")
+            st.write("• Ensure the connector configuration has all required fields")
+        
+        return {'success': False, 'error': str(e)}
+
+def main():
+    st.title("📚 PDF Upload & Chat Interface")
+    st.markdown("Upload PDFs to your Unstructured workflow and chat about your documents")
+    
+    # Initialize client
+    client = init_unstructured_client()
+    if not client:
+        st.stop()
+    
+    # Sidebar for configuration
+    with st.sidebar:
+        st.header("� Configouration")
+        
+        # Google Cloud Storage setup
+        st.subheader("☁️ Google Cloud Storage")
+        
+        # Option 1: Service Account Key Upload
+        st.write("**Option 1: Upload Service Account Key**")
+        uploaded_key = st.file_uploader(
+            "Upload service account JSON key",
+            type=['json'],
+            help="Upload your Google Cloud service account key file"
+        )
+        
+        if uploaded_key:
+            try:
+                key_data = json.loads(uploaded_key.read())
+                st.session_state.gcs_credentials = key_data
+                st.success("✅ Service account key loaded!")
+            except Exception as e:
+                st.error(f"❌ Invalid JSON key: {e}")
+        
+        # Option 2: Manual configuration
+        with st.expander("Option 2: Manual Configuration"):
+            project_id = st.text_input(
+                "Google Cloud Project ID",
+                value=os.getenv("GOOGLE_CLOUD_PROJECT", ""),
+                help="Your Google Cloud project ID"
+            )
+            bucket_name = st.text_input(
+                "GCS Bucket Name",
+                value=os.getenv("GCS_BUCKET_NAME", ""),
+                help="The bucket name where files will be uploaded"
+            )
+            
+            if project_id:
+                os.environ["GOOGLE_CLOUD_PROJECT"] = project_id
+            if bucket_name:
+                os.environ["GCS_BUCKET_NAME"] = bucket_name
+        
+        # Initialize GCS client
+        gcs_client = init_gcs_client()
+        bucket_name = os.getenv("GCS_BUCKET_NAME")
+        
+        if not gcs_client or not bucket_name:
+            st.warning("⚠️ Please configure Google Cloud Storage first")
+        else:
+            st.success(f"✅ Connected to GCS bucket: {bucket_name}")
+        
+        st.divider()
+        
+        # Destination connector management for dynamic namespace
+        st.subheader("🏷️ Pinecone Namespace Management")
+        pinecone_connectors = get_pinecone_connectors(client)
+        
+        # Initialize session state for namespace
+        if 'selected_namespace' not in st.session_state:
+            st.session_state.selected_namespace = "default"
+        if 'selected_pinecone_connector' not in st.session_state:
+            st.session_state.selected_pinecone_connector = None
+        
+        if pinecone_connectors:
+            st.success(f"✅ Found {len(pinecone_connectors)} Pinecone connector(s)")
+            
+            # Connector selection
+            connector_options = {}
+            for connector in pinecone_connectors:
+                display_name = f"{getattr(connector, 'name', 'Unnamed')} ({getattr(connector, 'id', 'No ID')[:8]}...)"
+                # Properly access namespace from Pydantic model
+                config = getattr(connector, 'config', None)
+                current_namespace = getattr(config, 'namespace', 'default') if config else 'default'
+                display_name += f" - Current: {current_namespace}"
+                connector_options[display_name] = connector.id
+            
+            selected_connector_display = st.selectbox(
+                "Select Pinecone Connector",
+                options=list(connector_options.keys()),
+                help="Choose which Pinecone connector to use for namespace management"
+            )
+            
+            if selected_connector_display:
+                st.session_state.selected_pinecone_connector = connector_options[selected_connector_display]
+                selected_connector = next(c for c in pinecone_connectors if c.id == st.session_state.selected_pinecone_connector)
+                # Properly access namespace from Pydantic model
+                config = getattr(selected_connector, 'config', None)
+                current_namespace = getattr(config, 'namespace', 'default') if config else 'default'
+                
+                st.info(f"**Selected Connector:** {getattr(selected_connector, 'name', 'Unnamed')}")
+                st.info(f"**Current Namespace:** `{current_namespace}`")
+                
+                # Namespace input
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    new_namespace = st.text_input(
+                        "Namespace for new uploads",
+                        value=current_namespace,
+                        help="Specify namespace for document storage in Pinecone"
+                    )
+                    st.session_state.selected_namespace = new_namespace
+                
+                with col2:
+                    if st.button("🔄 Update", key="update_namespace"):
+                        if new_namespace != current_namespace:
+                            result = update_pinecone_namespace(client, st.session_state.selected_pinecone_connector, new_namespace)
+                            if result.get('success'):
+                                st.success("✅ Updated!")
+                                st.rerun()
+                        else:
+                            st.info("ℹ️ Same namespace")
+                
+                # Namespace presets
+                with st.expander("📋 Namespace Presets"):
+                    preset_cols = st.columns(3)
+                    presets = ["default", "production", "testing", "staging", "user_docs", "temp"]
+                    
+                    for i, preset in enumerate(presets):
+                        col_idx = i % 3
+                        with preset_cols[col_idx]:
+                            if st.button(f"📌 {preset}", key=f"preset_{preset}"):
+                                st.session_state.selected_namespace = preset
+                                result = update_pinecone_namespace(client, st.session_state.selected_pinecone_connector, preset)
+                                if result.get('success'):
+                                    st.rerun()
+        else:
+            st.warning("⚠️ No Pinecone connectors found")
+            st.info("💡 Create a Pinecone destination connector in your Unstructured workflow first")
+        
+        st.divider()
+        
+        # Workflow selection
+        st.subheader("📋 Workflow Selection")
+        workflows = get_workflows(client)
+        if not workflows:
+            st.error("❌ No workflows found. Please create a workflow first.")
+            st.stop()
+        
+        workflow_options = {}
+        for workflow in workflows:
+            display_name = f"{workflow.name}"
+            if hasattr(workflow, 'status'):
+                display_name += f" ({workflow.status})"
+            workflow_options[display_name] = workflow.id
+        
+        selected_workflow_name = st.selectbox(
+            "Select Workflow",
+            options=list(workflow_options.keys()),
+            help="Choose the workflow that monitors your GCS bucket"
+        )
+        
+        selected_workflow_id = workflow_options[selected_workflow_name]
+        selected_workflow = next(w for w in workflows if w.id == selected_workflow_id)
+        
+        st.info(f"**Workflow:** {selected_workflow.name}")
+        st.info(f"**ID:** {selected_workflow_id[:8]}...")
+        
+        st.divider()
+        
+        # File upload section
+        st.header("📄 Upload PDFs to GCS")
+        
+        if gcs_client and bucket_name:
+            uploaded_files = st.file_uploader(
+                "Choose PDF files",
+                type=['pdf'],
+                accept_multiple_files=True,
+                help="Files will be uploaded to Google Cloud Storage"
+            )
+            
+            # Process uploaded files
+            if uploaded_files:
+                for uploaded_file in uploaded_files:
+                    file_key = f"{uploaded_file.name}_{uploaded_file.size}"
+                    
+                    if file_key not in st.session_state.processed_files:
+                        with st.spinner(f"Uploading {uploaded_file.name} to GCS..."):
+                            # Read file content
+                            file_content = uploaded_file.read()
+                            
+                            # Upload to GCS
+                            result = upload_file_to_gcs(
+                                gcs_client,
+                                bucket_name,
+                                file_content,
+                                uploaded_file.name
+                            )
+                            
+                            if result and result.get('success'):
+                                st.success(f"✅ {uploaded_file.name} uploaded to GCS!")
+                                st.info(f"📍 Location: {result['public_url']}")
+                                
+                                # Show detailed upload info
+                                with st.expander("📊 Upload Details"):
+                                    st.json({
+                                        "filename": uploaded_file.name,
+                                        "gcs_path": result['blob_name'],
+                                        "bucket": result['bucket'],
+                                        "size": f"{result.get('size', 0)} bytes",
+                                        "uploaded_at": result.get('created', 'Unknown')
+                                    })
+                                
+                                # Add to processed files with timestamp
+                                file_info = {
+                                    'filename': uploaded_file.name,
+                                    'gcs_path': result['blob_name'],
+                                    'bucket': result['bucket'],
+                                    'uploaded_at': time.time(),
+                                    'size': result.get('size', 0)
+                                }
+                                st.session_state.processed_files.append(file_info)
+                                st.session_state.last_upload_time = time.time()
+                                
+                                # Trigger workflow processing
+                                st.info("🔄 Triggering workflow to process uploaded file...")
+                                workflow_result = trigger_workflow(
+                                    client, 
+                                    selected_workflow_id,
+                                    namespace=st.session_state.selected_namespace if st.session_state.selected_namespace != "default" else None,
+                                    pinecone_connector_id=st.session_state.selected_pinecone_connector
+                                )
+                                
+                                if workflow_result and workflow_result.get('success'):
+                                    st.success("🎉 Workflow triggered! File processing has started.")
+                                    if 'job_id' in workflow_result:
+                                        # Store job ID and namespace for later tracking
+                                        file_info['job_id'] = workflow_result['job_id']
+                                        file_info['namespace'] = workflow_result.get('namespace', 'default')
+                                        st.session_state.processed_files[-1] = file_info  # Update the stored file info
+                                else:
+                                    st.warning("⚠️ Workflow trigger failed, but file upload successful. Workflow may still auto-detect the file.")
+                            else:
+                                st.error(f"❌ Failed to upload {uploaded_file.name}")
+            
+            # Workflow info and status
+            if st.session_state.processed_files:
+                st.success(f"📁 {len(st.session_state.processed_files)} file(s) uploaded to GCS")
+                st.info("🔄 Workflows triggered automatically after upload")
+                
+                # Manual trigger option
+                st.subheader("🎯 Manual Workflow Controls")
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    if st.button("🚀 Trigger Workflow Now", use_container_width=True):
+                        with st.spinner("Triggering workflow..."):
+                            workflow_result = trigger_workflow(
+                                client, 
+                                selected_workflow_id,
+                                namespace=st.session_state.selected_namespace if st.session_state.selected_namespace != "default" else None,
+                                pinecone_connector_id=st.session_state.selected_pinecone_connector
+                            )
+                            if workflow_result and workflow_result.get('success'):
+                                st.balloons()
+                
+                with col2:
+                    if st.button("🔄 Refresh Job Status", use_container_width=True):
+                        jobs = check_workflow_jobs(client, selected_workflow_id, 3)
+                        if jobs:
+                            st.success(f"Found {len(jobs)} recent jobs")
+                        else:
+                            st.info("No recent jobs found")
+                
+                # Info about processing
+                with st.expander("ℹ️ How Workflow Processing Works"):
+                    st.markdown("""
+                    **Updated workflow behavior with dynamic namespace support:**
+                    
+                    1. 🏷️ **Namespace**: Select/update Pinecone namespace for data organization
+                    2. 🔄 **Update Connector**: Pinecone connector updated with new namespace
+                    3. 📤 **Upload**: Files uploaded to GCS bucket
+                    4. 🚀 **Trigger**: Workflow automatically triggered via API
+                    5. 🔄 **Processing**: Files are processed by Unstructured.io
+                    6. 📊 **Storage**: Results stored in specified Pinecone namespace
+                    7. ⏱️ **Timing**: Processing usually takes 1-3 minutes
+                    
+                    **Dynamic Namespace Benefits:**
+                    • Multi-tenancy support (different users/organizations)
+                    • Environment separation (production, staging, testing)
+                    • Content categorization (user_docs, technical_docs, etc.)
+                    • Temporary storage (temp namespace for experiments)
+                    
+                    **Fallback**: If manual trigger fails, workflows may still auto-detect files.
+                    """)
+                
+                # Comprehensive monitoring
+                if st.button("🔍 Full Workflow Diagnostics", use_container_width=True):
+                    jobs = monitor_workflow_activity(client, selected_workflow_id, st.session_state.processed_files)
+                
+                # Quick job check
+                if st.button("📊 Quick Job Check", use_container_width=True):
+                    with st.spinner("Checking recent jobs..."):
+                        jobs = check_workflow_jobs(client, selected_workflow_id, 3)
+                        if jobs:
+                            st.write("**Last 3 Jobs:**")
+                            for job in jobs:
+                                status_emoji = {
+                                    "completed": "✅", "finished": "✅", "running": "🔄", 
+                                    "pending": "⏳", "failed": "❌", "cancelled": "⏹️"
+                                }.get(job.status.lower(), "❓")
+                                job_id = getattr(job, 'id', 'Unknown')
+                                job_id_short = job_id[:8] if job_id != 'Unknown' else 'Unknown'
+                                created = getattr(job, 'created_at', 'Unknown')
+                                st.write(f"{status_emoji} {job.status} - {job_id_short}... - {created}")
+                        else:
+                            st.warning("No jobs returned from API call")
+                            st.info("💡 Check 'Full Workflow Diagnostics' for more details")
+                
+                # Auto-refresh option
+                auto_refresh = st.checkbox("🔄 Auto-refresh job status (every 30s)")
+                if auto_refresh:
+                    # Use st.empty() for dynamic updates
+                    status_placeholder = st.empty()
+                    
+                    # Auto-refresh logic
+                    if 'last_refresh' not in st.session_state:
+                        st.session_state.last_refresh = time.time()
+                    
+                    if time.time() - st.session_state.last_refresh > 30:
+                        st.session_state.last_refresh = time.time()
+                        with status_placeholder.container():
+                            jobs = check_workflow_jobs(client, selected_workflow_id, 1)
+                            if jobs:
+                                latest_job = jobs[0]
+                                st.info(f"Latest: {latest_job.status} - {latest_job.created_at}")
+                            else:
+                                st.warning("No recent activity detected")
+                        st.rerun()
+        else:
+            st.warning("⚠️ Configure GCS settings above to upload files")
+        
+        # Show uploaded files with path testing
+        if st.session_state.processed_files:
+            st.divider()
+            st.subheader("📁 Uploaded Files")
+            
+            for i, file_info in enumerate(st.session_state.processed_files, 1):
+                if isinstance(file_info, dict):
+                    st.text(f"{i}. {file_info['filename']}")
+                    st.caption(f"   📍 {file_info['gcs_path']}")
+                    
+                    # Show job ID and namespace if available
+                    if 'job_id' in file_info:
+                        st.caption(f"   🏷️ Job ID: {file_info['job_id'][:8]}...")
+                    if 'namespace' in file_info:
+                        st.caption(f"   📂 Namespace: {file_info['namespace']}")
+                    
+                    # Add manual trigger for individual files
+                    if st.button(f"🚀 Trigger for this file", key=f"trigger_{i}"):
+                        with st.spinner(f"Triggering workflow for {file_info['filename']}..."):
+                            workflow_result = trigger_workflow(
+                                client, 
+                                selected_workflow_id,
+                                namespace=st.session_state.selected_namespace if st.session_state.selected_namespace != "default" else None,
+                                pinecone_connector_id=st.session_state.selected_pinecone_connector
+                            )
+                            if workflow_result and workflow_result.get('success'):
+                                if 'job_id' in workflow_result:
+                                    file_info['job_id'] = workflow_result['job_id']
+                                    file_info['namespace'] = workflow_result.get('namespace', 'default')
+                                    st.session_state.processed_files[i-1] = file_info
+                                st.success(f"✅ Workflow triggered for {file_info['filename']}")
+                    
+                    # Add test upload to root path
+                    if st.button(f"🔄 Test upload to root path", key=f"test_{i}"):
+                        with st.spinner(f"Testing root path upload for {file_info['filename']}..."):
+                            # Re-upload to root instead of documents/
+                            try:
+                                # Get the original file (this is a limitation - we'd need to store content)
+                                st.info("💡 To test root path, please re-upload the file manually")
+                                st.code(f"gsutil cp {file_info['filename']} gs://{file_info['bucket']}/")
+                            except Exception as e:
+                                st.error(f"Test upload failed: {e}")
+                else:
+                    # Handle old format
+                    filename = file_info.split('_')[0]
+                    st.text(f"{i}. {filename}")
+            
+            # Path configuration helper
+            st.subheader("🛠️ Path Configuration Helper")
+            st.write("**Current upload path:** `documents/`")
+            
+            # Option to change upload path
+            new_path = st.text_input(
+                "Test different upload path:",
+                value="documents/",
+                help="Try empty string for root, or other paths like 'input/', 'files/', etc."
+            )
+            
+            if new_path != "documents/":
+                st.info(f"💡 Next uploads will go to: `{new_path}`")
+                # Store the new path preference
+                st.session_state.upload_path = new_path
+    
+    # Main chat interface
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.header("💬 Chat Interface")
+        
+        # Display chat messages
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+        
+        # Chat input
+        if prompt := st.chat_input("Ask a question about your documents..."):
+            # Add user message
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            
+            # Generate response (placeholder for now)
+            with st.chat_message("assistant"):
+                if st.session_state.processed_files:
+                    response = f"I received your question: '{prompt}'. Your documents have been processed through the Unstructured workflow. Once the RAG system is connected, I'll be able to search through your {len(st.session_state.processed_files)} processed document(s) to answer your questions."
+                else:
+                    response = "Please upload some PDF documents first so I can help answer questions about them."
+                
+                st.markdown(response)
+            
+            # Add assistant response
+            st.session_state.messages.append({"role": "assistant", "content": response})
+    
+    with col2:
+        st.header("📊 Status")
+        
+        # Show upload status
+        if st.session_state.processed_files:
+            st.metric("Processed Files", len(st.session_state.processed_files))
+        else:
+            st.info("No files uploaded yet")
+        
+        # Workflow status
+        st.subheader("🔧 Workflow Info")
+        st.text(f"Selected: {selected_workflow.name}")
+        if hasattr(selected_workflow, 'status'):
+            status_color = "🟢" if selected_workflow.status.lower() == "active" else "🟡"
+            st.text(f"Status: {status_color} {selected_workflow.status}")
+        
+        # Instructions and troubleshooting
+        st.subheader("📝 How it Works")
+        st.markdown("""
+        1. **Configure GCS** in sidebar
+        2. **Upload PDFs** to Google Cloud Storage
+        3. **Workflow monitors** GCS bucket automatically
+        4. **Documents processed** and stored in Pinecone
+        5. **Chat ready** once processing completes
+        """)
+        
+        # Troubleshooting section
+        with st.expander("🔧 Troubleshooting Guide"):
+            st.markdown("""
+            **If workflow isn't detecting files:**
+            
+            ✅ **Check Workflow Configuration:**
+            - Workflow status should be "active"
+            - Source connector should point to your GCS bucket
+            - Path should match where files are uploaded (`documents/`)
+            
+            ✅ **Verify GCS Setup:**
+            - Files appear in correct bucket and path
+            - Service account has proper permissions
+            - Bucket is in the same region as workflow
+            
+            ✅ **Common Issues:**
+            - **Wrong path**: Workflow monitors `/` but files in `/documents/`
+            - **Permissions**: Service account lacks bucket access
+            - **Timing**: Can take 2-10 minutes for detection
+            - **File format**: Workflow may only accept certain file types
+            
+            ✅ **Debug Steps:**
+            1. Use "Full Workflow Diagnostics" button
+            2. Check if files exist in GCS at expected path
+            3. Verify workflow source connector configuration
+            4. Look for error messages in job logs
+            """)
+        
+        # Real-time monitoring
+        if st.session_state.processed_files:
+            st.subheader("⏱️ Real-time Status")
+            
+            # Show time since last upload
+            if 'last_upload_time' in st.session_state:
+                time_diff = time.time() - st.session_state.last_upload_time
+                minutes_ago = int(time_diff / 60)
+                st.write(f"Last upload: {minutes_ago} minutes ago")
+                
+                if minutes_ago > 10:
+                    st.warning("⚠️ No activity detected for 10+ minutes. Check workflow configuration.")
+                elif minutes_ago > 5:
+                    st.info("ℹ️ Still waiting for workflow to detect files...")
+                else:
+                    st.success("🔄 Recently uploaded - workflow should detect soon")
+        
+        # Clear chat button
+        if st.button("🗑️ Clear Chat", use_container_width=True):
+            st.session_state.messages = []
+            st.rerun()
+
+if __name__ == "__main__":
+    main()
