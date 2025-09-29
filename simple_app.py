@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 from unstructured_client import UnstructuredClient
-from unstructured_client.models.operations import ListWorkflowsRequest, ListJobsRequest, RunWorkflowRequest, ListDestinationsRequest, UpdateDestinationRequest
-from unstructured_client.models.shared import UpdateDestinationConnector
+from unstructured_client.models.operations import ListWorkflowsRequest, ListJobsRequest, RunWorkflowRequest, ListDestinationsRequest, UpdateDestinationRequest, CreateSourceRequest
+from unstructured_client.models.shared import UpdateDestinationConnector, CreateSourceConnector
 from google.cloud import storage
 from google.oauth2 import service_account
 
@@ -23,16 +23,18 @@ load_dotenv()
 
 # Page config
 st.set_page_config(
-    page_title="PDF Upload & Chat",
+    page_title="PDF Upload & Processing",
     page_icon="📚",
     layout="wide"
 )
 
 # Initialize session state
-if 'messages' not in st.session_state:
-    st.session_state.messages = []
 if 'processed_files' not in st.session_state:
     st.session_state.processed_files = []
+if 'custom_folder_name' not in st.session_state:
+    st.session_state.custom_folder_name = ""
+if 'created_source_connector' not in st.session_state:
+    st.session_state.created_source_connector = None
 
 @st.cache_resource
 def init_unstructured_client():
@@ -277,10 +279,13 @@ def upload_file_to_gcs(gcs_client, bucket_name, file_content, filename):
         logger.info(f"Got bucket reference: {bucket_name}")
         
         # Create a blob (file) in the bucket
-        # Use custom path if set, otherwise default to protocols/dev
-        upload_path = getattr(st.session_state, 'upload_path', 'protocols/dev')
-        if upload_path and not upload_path.endswith('/'):
-            upload_path += '/'
+        # Use custom folder name if available, otherwise default paths
+        if st.session_state.custom_folder_name:
+            upload_path = f"{st.session_state.custom_folder_name}/"
+        else:
+            upload_path = getattr(st.session_state, 'upload_path', 'protocols/dev')
+            if upload_path and not upload_path.endswith('/'):
+                upload_path += '/'
         blob_name = f"{upload_path}{filename}"
         blob = bucket.blob(blob_name)
         logger.info(f"Created blob reference: {blob_name}")
@@ -329,6 +334,15 @@ def trigger_workflow(unstructured_client, workflow_id, namespace=None, pinecone_
         
         logger.info(f"Triggering workflow {workflow_id}")
         
+        # Print workflow input details
+        print(f"\n=== WORKFLOW EXECUTION STARTED ===")
+        print(f"📥 Workflow Input Details:")
+        print(f"   • Workflow ID: {workflow_id}")
+        print(f"   • Namespace: {namespace or 'default'}")
+        print(f"   • Pinecone Connector ID: {pinecone_connector_id or 'N/A'}")
+        print(f"   • Custom Folder: {getattr(st.session_state, 'custom_folder_name', 'N/A')}")
+        print(f"   • Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
         # Create the workflow run request (only workflow_id is supported)
         response = unstructured_client.workflows.run_workflow(
             request=RunWorkflowRequest(
@@ -349,6 +363,16 @@ def trigger_workflow(unstructured_client, workflow_id, namespace=None, pinecone_
             if job_info:
                 job_id = getattr(job_info, 'id', 'Unknown')
                 job_status = getattr(job_info, 'status', 'Unknown')
+                
+                # Print workflow output details
+                print(f"\n📤 Workflow Output Details:")
+                print(f"   • Job ID: {job_id}")
+                print(f"   • Initial Status: {job_status}")
+                print(f"   • Response Type: {type(response).__name__}")
+                print(f"   • Job Info: {job_info}")
+                print(f"   • Success: True")
+                print(f"=== WORKFLOW EXECUTION COMPLETED ===\n")
+                
                 st.success(f"✅ Workflow triggered successfully!")
                 st.info(f"📋 Job ID: {job_id}")
                 st.info(f"🔄 Initial Status: {job_status}")
@@ -356,16 +380,38 @@ def trigger_workflow(unstructured_client, workflow_id, namespace=None, pinecone_
                     st.info(f"🏷️ Using namespace: `{namespace}`")
                 return {'success': True, 'job_id': job_id, 'job_info': job_info, 'namespace': namespace}
             else:
+                # Print workflow output details for case without job info
+                print(f"\n📤 Workflow Output Details:")
+                print(f"   • Response Type: {type(response).__name__}")
+                print(f"   • Raw Response: {getattr(response, 'raw_response', 'N/A')}")
+                print(f"   • Success: True")
+                print(f"   • Note: Job details available in monitoring")
+                print(f"=== WORKFLOW EXECUTION COMPLETED ===\n")
+                
                 st.success(f"✅ Workflow triggered successfully!")
                 st.info("📋 Job details will be available in workflow monitoring")
                 if namespace:
                     st.info(f"🏷️ Using namespace: `{namespace}`")
                 return {'success': True, 'response': response, 'namespace': namespace}
         else:
+            # Print workflow output for basic success case
+            print(f"\n📤 Workflow Output Details:")
+            print(f"   • Response: Basic success (no detailed response object)")
+            print(f"   • Success: True")
+            print(f"=== WORKFLOW EXECUTION COMPLETED ===\n")
+            
             st.success(f"✅ Workflow trigger request sent")
             return {'success': True, 'namespace': namespace}
             
     except Exception as e:
+        # Print workflow error details
+        print(f"\n❌ WORKFLOW EXECUTION FAILED")
+        print(f"📤 Error Details:")
+        print(f"   • Error Type: {type(e).__name__}")
+        print(f"   • Error Message: {str(e)}")
+        print(f"   • Success: False")
+        print(f"=== WORKFLOW EXECUTION COMPLETED ===\n")
+        
         logger.error(f"Error triggering workflow: {e}")
         st.error(f"❌ Error triggering workflow: {e}")
         
@@ -495,9 +541,94 @@ def update_pinecone_namespace(client, connector_id, new_namespace, connector_con
         
         return {'success': False, 'error': str(e)}
 
+def create_gcs_source_connector(client, folder_name, bucket_name):
+    """Create a GCS source connector with custom folder name and datetime suffix"""
+    try:
+        # Generate datetime suffix
+        datetime_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Create connector name with folder and datetime
+        connector_name = f"gcs_{folder_name}_{datetime_suffix}" if folder_name else f"gcs_{datetime_suffix}"
+        
+        # Store globally in session state
+        st.session_state.custom_folder_name = f"{folder_name}_{datetime_suffix}" if folder_name else datetime_suffix
+        
+        logger.info(f"Creating GCS source connector: {connector_name}")
+        logger.info(f"Custom folder name: {st.session_state.custom_folder_name}")
+        
+        # Get GCS service account key from session state or environment
+        service_account_key = None
+        if 'gcs_credentials' in st.session_state:
+            service_account_key = json.dumps(st.session_state.gcs_credentials)
+        else:
+            # Try to get from environment file
+            credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            if credentials_path and os.path.exists(credentials_path):
+                with open(credentials_path, 'r') as f:
+                    service_account_key = f.read()
+        
+        if not service_account_key:
+            raise Exception("Service account key is required for GCS source connector")
+        
+        # Create remote URL with custom folder
+        remote_url = f"gs://{bucket_name}/{st.session_state.custom_folder_name}/"
+        
+        # Create the source connector
+        response = client.sources.create_source(
+            request=CreateSourceRequest(
+                create_source_connector=CreateSourceConnector(
+                    name="gcs",
+                    type="gcs",
+                    config={
+                        "service_account_key": service_account_key,
+                        "remote_url": remote_url,
+                        "recursive": True
+                    }
+                )
+            )
+        )
+        
+        if response and hasattr(response, 'source_connector_information'):
+            connector_info = response.source_connector_information
+            logger.info(f"Successfully created GCS source connector: {connector_info}")
+            
+            # Store connector info globally
+            st.session_state.created_source_connector = {
+                'id': getattr(connector_info, 'id', None),
+                'name': connector_name,
+                'remote_url': remote_url,
+                'folder_name': st.session_state.custom_folder_name
+            }
+            
+            st.success(f"✅ Created GCS source connector: `{connector_name}`")
+            st.info(f"📁 Custom folder: `{st.session_state.custom_folder_name}`")
+            st.info(f"🔗 Remote URL: `{remote_url}`")
+            
+            return {
+                'success': True,
+                'connector_info': connector_info,
+                'connector_name': connector_name,
+                'folder_name': st.session_state.custom_folder_name,
+                'remote_url': remote_url
+            }
+        else:
+            raise Exception("No connector information returned from API")
+            
+    except Exception as e:
+        logger.error(f"Error creating GCS source connector: {e}")
+        st.error(f"❌ Error creating GCS source connector: {e}")
+        
+        # Show helpful debug information
+        st.error("🔧 **Troubleshooting:**")
+        st.write("• Ensure GOOGLE_APPLICATION_CREDENTIALS is set or service account key is uploaded")
+        st.write("• Check that the bucket name is valid and accessible")
+        st.write("• Verify Unstructured API permissions for source connector creation")
+        
+        return {'success': False, 'error': str(e)}
+
 def main():
-    st.title("📚 PDF Upload & Chat Interface")
-    st.markdown("Upload PDFs to your Unstructured workflow and chat about your documents")
+    st.title("📚 PDF Upload & Processing Interface")
+    st.markdown("Upload PDFs to your Unstructured workflow for document processing")
     
     # Initialize client
     client = init_unstructured_client()
@@ -508,53 +639,9 @@ def main():
     with st.sidebar:
         st.header("� Configouration")
         
-        # Google Cloud Storage setup
-        st.subheader("☁️ Google Cloud Storage")
-        
-        # Option 1: Service Account Key Upload
-        st.write("**Option 1: Upload Service Account Key**")
-        uploaded_key = st.file_uploader(
-            "Upload service account JSON key",
-            type=['json'],
-            help="Upload your Google Cloud service account key file"
-        )
-        
-        if uploaded_key:
-            try:
-                key_data = json.loads(uploaded_key.read())
-                st.session_state.gcs_credentials = key_data
-                st.success("✅ Service account key loaded!")
-            except Exception as e:
-                st.error(f"❌ Invalid JSON key: {e}")
-        
-        # Option 2: Manual configuration
-        with st.expander("Option 2: Manual Configuration"):
-            project_id = st.text_input(
-                "Google Cloud Project ID",
-                value=os.getenv("GOOGLE_CLOUD_PROJECT", ""),
-                help="Your Google Cloud project ID"
-            )
-            bucket_name = st.text_input(
-                "GCS Bucket Name",
-                value=os.getenv("GCS_BUCKET_NAME", ""),
-                help="The bucket name where files will be uploaded"
-            )
-            
-            if project_id:
-                os.environ["GOOGLE_CLOUD_PROJECT"] = project_id
-            if bucket_name:
-                os.environ["GCS_BUCKET_NAME"] = bucket_name
-        
         # Initialize GCS client
         gcs_client = init_gcs_client()
         bucket_name = os.getenv("GCS_BUCKET_NAME")
-        
-        if not gcs_client or not bucket_name:
-            st.warning("⚠️ Please configure Google Cloud Storage first")
-        else:
-            st.success(f"✅ Connected to GCS bucket: {bucket_name}")
-        
-        st.divider()
         
         # Destination connector management for dynamic namespace
         st.subheader("🏷️ Pinecone Namespace Management")
@@ -897,111 +984,106 @@ def main():
                 # Store the new path preference
                 st.session_state.upload_path = new_path
     
-    # Main chat interface
-    col1, col2 = st.columns([2, 1])
+    # Main status and monitoring interface
+    st.header("📊 Status & Monitoring")
     
-    with col1:
-        st.header("💬 Chat Interface")
+    # Show custom folder status
+    if st.session_state.custom_folder_name or st.session_state.created_source_connector:
+        st.subheader("📁 Custom Folder Configuration")
         
-        # Display chat messages
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.session_state.custom_folder_name:
+                st.success(f"**Custom Folder:** `{st.session_state.custom_folder_name}`")
+            else:
+                st.info("No custom folder configured")
         
-        # Chat input
-        if prompt := st.chat_input("Ask a question about your documents..."):
-            # Add user message
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"):
-                st.markdown(prompt)
-            
-            # Generate response (placeholder for now)
-            with st.chat_message("assistant"):
-                if st.session_state.processed_files:
-                    response = f"I received your question: '{prompt}'. Your documents have been processed through the Unstructured workflow. Once the RAG system is connected, I'll be able to search through your {len(st.session_state.processed_files)} processed document(s) to answer your questions."
-                else:
-                    response = "Please upload some PDF documents first so I can help answer questions about them."
-                
-                st.markdown(response)
-            
-            # Add assistant response
-            st.session_state.messages.append({"role": "assistant", "content": response})
+        with col2:
+            if st.session_state.created_source_connector:
+                connector_info = st.session_state.created_source_connector
+                st.success(f"**GCS Connector:** `{connector_info['name']}`")
+                st.info(f"**Remote URL:** `{connector_info['remote_url']}`")
+            else:
+                st.info("No custom GCS connector created")
+        
+        st.divider()
     
-    with col2:
-        st.header("📊 Status")
-        
-        # Show upload status
-        if st.session_state.processed_files:
-            st.metric("Processed Files", len(st.session_state.processed_files))
-        else:
-            st.info("No files uploaded yet")
-        
-        # Workflow status
-        st.subheader("🔧 Workflow Info")
-        st.text(f"Selected: {selected_workflow.name}")
-        if hasattr(selected_workflow, 'status'):
-            status_color = "🟢" if selected_workflow.status.lower() == "active" else "🟡"
-            st.text(f"Status: {status_color} {selected_workflow.status}")
-        
-        # Instructions and troubleshooting
-        st.subheader("📝 How it Works")
+    # Show upload status
+    if st.session_state.processed_files:
+        st.metric("Processed Files", len(st.session_state.processed_files))
+    else:
+        st.info("No files uploaded yet")
+    
+    # Workflow status
+    st.subheader("🔧 Workflow Info")
+    st.text(f"Selected: {selected_workflow.name}")
+    if hasattr(selected_workflow, 'status'):
+        status_color = "🟢" if selected_workflow.status.lower() == "active" else "🟡"
+        st.text(f"Status: {status_color} {selected_workflow.status}")
+    
+    # Instructions and troubleshooting
+    st.subheader("📝 How it Works")
+    st.markdown("""
+    1. **Configure GCS** in sidebar
+    2. **Create Custom Folder** (optional) with datetime suffix
+    3. **Create GCS Source Connector** for custom folder monitoring
+    4. **Upload PDFs** to Google Cloud Storage in custom folder
+    5. **Workflow monitors** custom folder automatically
+    6. **Documents processed** and stored in Pinecone
+    7. **Processing ready** once upload completes
+    
+    **📁 Custom Folder Benefits:**
+    - **Organized storage** with timestamp-based folders
+    - **Dedicated source connectors** for specific folders
+    - **Automatic workflow monitoring** of custom paths
+    - **Global folder name** stored for consistent use
+    """)
+    
+    # Troubleshooting section
+    with st.expander("🔧 Troubleshooting Guide"):
         st.markdown("""
-        1. **Configure GCS** in sidebar
-        2. **Upload PDFs** to Google Cloud Storage
-        3. **Workflow monitors** GCS bucket automatically
-        4. **Documents processed** and stored in Pinecone
-        5. **Chat ready** once processing completes
+        **If workflow isn't detecting files:**
+        
+        ✅ **Check Workflow Configuration:**
+        - Workflow status should be "active"
+        - Source connector should point to your GCS bucket
+        - Path should match where files are uploaded (`documents/`)
+        
+        ✅ **Verify GCS Setup:**
+        - Files appear in correct bucket and path
+        - Service account has proper permissions
+        - Bucket is in the same region as workflow
+        
+        ✅ **Common Issues:**
+        - **Wrong path**: Workflow monitors `/` but files in `/documents/`
+        - **Permissions**: Service account lacks bucket access
+        - **Timing**: Can take 2-10 minutes for detection
+        - **File format**: Workflow may only accept certain file types
+        
+        ✅ **Debug Steps:**
+        1. Use "Full Workflow Diagnostics" button
+        2. Check if files exist in GCS at expected path
+        3. Verify workflow source connector configuration
+        4. Look for error messages in job logs
         """)
+    
+    # Real-time monitoring
+    if st.session_state.processed_files:
+        st.subheader("⏱️ Real-time Status")
         
-        # Troubleshooting section
-        with st.expander("🔧 Troubleshooting Guide"):
-            st.markdown("""
-            **If workflow isn't detecting files:**
+        # Show time since last upload
+        if 'last_upload_time' in st.session_state:
+            time_diff = time.time() - st.session_state.last_upload_time
+            minutes_ago = int(time_diff / 60)
+            st.write(f"Last upload: {minutes_ago} minutes ago")
             
-            ✅ **Check Workflow Configuration:**
-            - Workflow status should be "active"
-            - Source connector should point to your GCS bucket
-            - Path should match where files are uploaded (`documents/`)
-            
-            ✅ **Verify GCS Setup:**
-            - Files appear in correct bucket and path
-            - Service account has proper permissions
-            - Bucket is in the same region as workflow
-            
-            ✅ **Common Issues:**
-            - **Wrong path**: Workflow monitors `/` but files in `/documents/`
-            - **Permissions**: Service account lacks bucket access
-            - **Timing**: Can take 2-10 minutes for detection
-            - **File format**: Workflow may only accept certain file types
-            
-            ✅ **Debug Steps:**
-            1. Use "Full Workflow Diagnostics" button
-            2. Check if files exist in GCS at expected path
-            3. Verify workflow source connector configuration
-            4. Look for error messages in job logs
-            """)
+            if minutes_ago > 10:
+                st.warning("⚠️ No activity detected for 10+ minutes. Check workflow configuration.")
+            elif minutes_ago > 5:
+                st.info("ℹ️ Still waiting for workflow to detect files...")
+            else:
+                st.success("🔄 Recently uploaded - workflow should detect soon")
         
-        # Real-time monitoring
-        if st.session_state.processed_files:
-            st.subheader("⏱️ Real-time Status")
-            
-            # Show time since last upload
-            if 'last_upload_time' in st.session_state:
-                time_diff = time.time() - st.session_state.last_upload_time
-                minutes_ago = int(time_diff / 60)
-                st.write(f"Last upload: {minutes_ago} minutes ago")
-                
-                if minutes_ago > 10:
-                    st.warning("⚠️ No activity detected for 10+ minutes. Check workflow configuration.")
-                elif minutes_ago > 5:
-                    st.info("ℹ️ Still waiting for workflow to detect files...")
-                else:
-                    st.success("🔄 Recently uploaded - workflow should detect soon")
-        
-        # Clear chat button
-        if st.button("🗑️ Clear Chat", use_container_width=True):
-            st.session_state.messages = []
-            st.rerun()
 
 if __name__ == "__main__":
     main()
