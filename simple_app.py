@@ -5,6 +5,7 @@ import tempfile
 import json
 import logging
 import threading
+import base64
 from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
@@ -29,6 +30,7 @@ PUBSUB_PROJECT_ID = os.getenv("PUBSUB_PROJECT_ID")
 PUBSUB_TOPIC = os.getenv("PUBSUB_TOPIC", "workflow-jobs")
 PUBSUB_SUBSCRIPTION = os.getenv("PUBSUB_SUBSCRIPTION", "workflow-jobs-sub")
 PUBSUB_CREDENTIALS_PATH = os.getenv("GCP_PUB_SUB_CREDENTIALS")
+PUBSUB_CREDENTIALS_BASE64 = os.getenv("GCP_PUB_SUB_CREDENTIALS_BASE64")
 
 # Global thread-safe job tracking
 import threading
@@ -74,44 +76,80 @@ def init_unstructured_client():
 def init_gcs_client():
     """Initialize Google Cloud Storage client"""
     try:
-        # Try to get credentials from environment variable
-        credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
         
-        if credentials_path and os.path.exists(credentials_path):
-            # Use service account file
-            credentials = service_account.Credentials.from_service_account_file(credentials_path)
-            client = storage.Client(credentials=credentials, project=project_id)
-        else:
-            # Try to use default credentials or service account key from session state
-            if 'gcs_credentials' in st.session_state:
-                credentials_info = st.session_state.gcs_credentials
+        # Priority 1: Check for base64-encoded credentials (deployment)
+        credentials_base64 = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_BASE64")
+        if credentials_base64:
+            logger.info("Using GOOGLE_APPLICATION_CREDENTIALS_BASE64")
+            try:
+                credentials_json = base64.b64decode(credentials_base64).decode('utf-8')
+                credentials_info = json.loads(credentials_json)
                 credentials = service_account.Credentials.from_service_account_info(credentials_info)
                 client = storage.Client(credentials=credentials, project=project_id)
-            else:
-                # Use default credentials (if running on GCP)
-                client = storage.Client(project=project_id)
+                return client
+            except Exception as e:
+                logger.error(f"Error decoding base64 credentials: {e}")
+                st.error(f"Error decoding base64 credentials: {e}")
         
+        # Priority 2: Check for file path (local development)
+        credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if credentials_path and os.path.exists(credentials_path):
+            logger.info(f"Using GOOGLE_APPLICATION_CREDENTIALS file: {credentials_path}")
+            credentials = service_account.Credentials.from_service_account_file(credentials_path)
+            client = storage.Client(credentials=credentials, project=project_id)
+            return client
+        
+        # Priority 3: Check session state
+        if 'gcs_credentials' in st.session_state:
+            logger.info("Using credentials from session state")
+            credentials_info = st.session_state.gcs_credentials
+            credentials = service_account.Credentials.from_service_account_info(credentials_info)
+            client = storage.Client(credentials=credentials, project=project_id)
+            return client
+        
+        # Priority 4: Use default credentials (if running on GCP)
+        logger.info("Using default GCP credentials")
+        client = storage.Client(project=project_id)
         return client
+        
     except Exception as e:
         st.error(f"Error initializing GCS client: {e}")
+        logger.error(f"Error initializing GCS client: {e}")
         return None
 
 @st.cache_resource
 def init_pubsub_publisher():
     """Initialize Google Cloud Pub/Sub publisher client"""
     try:
-        credentials_path = PUBSUB_CREDENTIALS_PATH
+        # Priority 1: Check for base64-encoded credentials (deployment)
+        if PUBSUB_CREDENTIALS_BASE64:
+            logger.info("Using GCP_PUB_SUB_CREDENTIALS_BASE64")
+            try:
+                credentials_json = base64.b64decode(PUBSUB_CREDENTIALS_BASE64).decode('utf-8')
+                credentials_info = json.loads(credentials_json)
+                credentials = service_account.Credentials.from_service_account_info(credentials_info)
+                publisher = pubsub_v1.PublisherClient(credentials=credentials)
+                logger.info("Pub/Sub publisher client initialized with base64 credentials")
+                return publisher
+            except Exception as e:
+                logger.error(f"Error decoding base64 Pub/Sub credentials: {e}")
+                st.error(f"Error decoding base64 Pub/Sub credentials: {e}")
         
-        if credentials_path and os.path.exists(credentials_path):
-            credentials = service_account.Credentials.from_service_account_file(credentials_path)
+        # Priority 2: Check for file path (local development)
+        if PUBSUB_CREDENTIALS_PATH and os.path.exists(PUBSUB_CREDENTIALS_PATH):
+            logger.info(f"Using GCP_PUB_SUB_CREDENTIALS file: {PUBSUB_CREDENTIALS_PATH}")
+            credentials = service_account.Credentials.from_service_account_file(PUBSUB_CREDENTIALS_PATH)
             publisher = pubsub_v1.PublisherClient(credentials=credentials)
-        else:
-            # Use default credentials
-            publisher = pubsub_v1.PublisherClient()
+            logger.info("Pub/Sub publisher client initialized with file credentials")
+            return publisher
         
-        logger.info("Pub/Sub publisher client initialized")
+        # Priority 3: Use default credentials
+        logger.info("Using default GCP credentials for Pub/Sub publisher")
+        publisher = pubsub_v1.PublisherClient()
+        logger.info("Pub/Sub publisher client initialized with default credentials")
         return publisher
+        
     except Exception as e:
         logger.error(f"Error initializing Pub/Sub publisher: {e}")
         st.error(f"Error initializing Pub/Sub publisher: {e}")
@@ -121,17 +159,34 @@ def init_pubsub_publisher():
 def init_pubsub_subscriber():
     """Initialize Google Cloud Pub/Sub subscriber client"""
     try:
-        credentials_path = PUBSUB_CREDENTIALS_PATH
+        # Priority 1: Check for base64-encoded credentials (deployment)
+        if PUBSUB_CREDENTIALS_BASE64:
+            logger.info("Using GCP_PUB_SUB_CREDENTIALS_BASE64")
+            try:
+                credentials_json = base64.b64decode(PUBSUB_CREDENTIALS_BASE64).decode('utf-8')
+                credentials_info = json.loads(credentials_json)
+                credentials = service_account.Credentials.from_service_account_info(credentials_info)
+                subscriber = pubsub_v1.SubscriberClient(credentials=credentials)
+                logger.info("Pub/Sub subscriber client initialized with base64 credentials")
+                return subscriber
+            except Exception as e:
+                logger.error(f"Error decoding base64 Pub/Sub credentials: {e}")
+                st.error(f"Error decoding base64 Pub/Sub credentials: {e}")
         
-        if credentials_path and os.path.exists(credentials_path):
-            credentials = service_account.Credentials.from_service_account_file(credentials_path)
+        # Priority 2: Check for file path (local development)
+        if PUBSUB_CREDENTIALS_PATH and os.path.exists(PUBSUB_CREDENTIALS_PATH):
+            logger.info(f"Using GCP_PUB_SUB_CREDENTIALS file: {PUBSUB_CREDENTIALS_PATH}")
+            credentials = service_account.Credentials.from_service_account_file(PUBSUB_CREDENTIALS_PATH)
             subscriber = pubsub_v1.SubscriberClient(credentials=credentials)
-        else:
-            # Use default credentials
-            subscriber = pubsub_v1.SubscriberClient()
+            logger.info("Pub/Sub subscriber client initialized with file credentials")
+            return subscriber
         
-        logger.info("Pub/Sub subscriber client initialized")
+        # Priority 3: Use default credentials
+        logger.info("Using default GCP credentials for Pub/Sub subscriber")
+        subscriber = pubsub_v1.SubscriberClient()
+        logger.info("Pub/Sub subscriber client initialized with default credentials")
         return subscriber
+        
     except Exception as e:
         logger.error(f"Error initializing Pub/Sub subscriber: {e}")
         st.error(f"Error initializing Pub/Sub subscriber: {e}")
@@ -649,11 +704,20 @@ def create_gcs_source_connector(client, folder_name, bucket_name):
         if 'gcs_credentials' in st.session_state:
             service_account_key = json.dumps(st.session_state.gcs_credentials)
         else:
-            # Try to get from environment file
-            credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-            if credentials_path and os.path.exists(credentials_path):
-                with open(credentials_path, 'r') as f:
-                    service_account_key = f.read()
+            # Priority 1: Check for base64-encoded credentials (deployment)
+            credentials_base64 = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_BASE64")
+            if credentials_base64:
+                try:
+                    service_account_key = base64.b64decode(credentials_base64).decode('utf-8')
+                except Exception as e:
+                    logger.error(f"Error decoding base64 credentials for source connector: {e}")
+            
+            # Priority 2: Try to get from environment file (local development)
+            if not service_account_key:
+                credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+                if credentials_path and os.path.exists(credentials_path):
+                    with open(credentials_path, 'r') as f:
+                        service_account_key = f.read()
         
         if not service_account_key:
             raise Exception("Service account key is required for GCS source connector")
