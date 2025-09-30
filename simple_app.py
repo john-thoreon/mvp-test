@@ -4,9 +4,12 @@ import time
 import tempfile
 import json
 import logging
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
+from google.cloud import pubsub_v1
+from google.api_core import retry
 from unstructured_client import UnstructuredClient
 from unstructured_client.models.operations import ListWorkflowsRequest, ListJobsRequest, RunWorkflowRequest, ListDestinationsRequest, UpdateDestinationRequest, CreateSourceRequest
 from unstructured_client.models.shared import UpdateDestinationConnector, CreateSourceConnector
@@ -20,6 +23,21 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
+
+# GCP Pub/Sub configuration
+PUBSUB_PROJECT_ID = os.getenv("PUBSUB_PROJECT_ID")
+PUBSUB_TOPIC = os.getenv("PUBSUB_TOPIC", "workflow-jobs")
+PUBSUB_SUBSCRIPTION = os.getenv("PUBSUB_SUBSCRIPTION", "workflow-jobs-sub")
+PUBSUB_CREDENTIALS_PATH = os.getenv("GCP_PUB_SUB_CREDENTIALS")
+
+# Global thread-safe job tracking
+import threading
+from queue import Queue
+
+# Global job state - thread safe
+current_job_lock = threading.Lock()
+current_job_id = None
+job_queue_count = 0
 
 # Page config
 st.set_page_config(
@@ -35,6 +53,12 @@ if 'custom_folder_name' not in st.session_state:
     st.session_state.custom_folder_name = ""
 if 'created_source_connector' not in st.session_state:
     st.session_state.created_source_connector = None
+if 'current_job_id' not in st.session_state:
+    st.session_state.current_job_id = None
+if 'job_queue_count' not in st.session_state:
+    st.session_state.job_queue_count = 0
+if 'pubsub_consumer_started' not in st.session_state:
+    st.session_state.pubsub_consumer_started = False
 
 @st.cache_resource
 def init_unstructured_client():
@@ -71,6 +95,46 @@ def init_gcs_client():
         return client
     except Exception as e:
         st.error(f"Error initializing GCS client: {e}")
+        return None
+
+@st.cache_resource
+def init_pubsub_publisher():
+    """Initialize Google Cloud Pub/Sub publisher client"""
+    try:
+        credentials_path = PUBSUB_CREDENTIALS_PATH
+        
+        if credentials_path and os.path.exists(credentials_path):
+            credentials = service_account.Credentials.from_service_account_file(credentials_path)
+            publisher = pubsub_v1.PublisherClient(credentials=credentials)
+        else:
+            # Use default credentials
+            publisher = pubsub_v1.PublisherClient()
+        
+        logger.info("Pub/Sub publisher client initialized")
+        return publisher
+    except Exception as e:
+        logger.error(f"Error initializing Pub/Sub publisher: {e}")
+        st.error(f"Error initializing Pub/Sub publisher: {e}")
+        return None
+
+@st.cache_resource
+def init_pubsub_subscriber():
+    """Initialize Google Cloud Pub/Sub subscriber client"""
+    try:
+        credentials_path = PUBSUB_CREDENTIALS_PATH
+        
+        if credentials_path and os.path.exists(credentials_path):
+            credentials = service_account.Credentials.from_service_account_file(credentials_path)
+            subscriber = pubsub_v1.SubscriberClient(credentials=credentials)
+        else:
+            # Use default credentials
+            subscriber = pubsub_v1.SubscriberClient()
+        
+        logger.info("Pub/Sub subscriber client initialized")
+        return subscriber
+    except Exception as e:
+        logger.error(f"Error initializing Pub/Sub subscriber: {e}")
+        st.error(f"Error initializing Pub/Sub subscriber: {e}")
         return None
 
 def get_workflows(client):
@@ -315,9 +379,15 @@ def upload_file_to_gcs(gcs_client, bucket_name, file_content, filename):
         st.error(f"Error uploading to GCS: {e}")
         return None
 
-def trigger_workflow(unstructured_client, workflow_id, namespace=None, pinecone_connector_id=None):
-    """Manually trigger a workflow to process uploaded files with optional namespace update"""
+def trigger_workflow(unstructured_client, workflow_id, namespace=None, pinecone_connector_id=None, retry_count=0, max_retries=3):
+    """Manually trigger a workflow to process uploaded files with optional namespace update and rate limiting protection"""
     try:
+        # Rate limiting protection with exponential backoff
+        if retry_count > 0:
+            wait_time = min(2 ** retry_count, 30)  # Exponential backoff, max 30 seconds
+            logger.info(f"Retry {retry_count}/{max_retries}, waiting {wait_time}s before retry...")
+            time.sleep(wait_time)
+        
         # If namespace is provided, update the Pinecone connector first
         if namespace and pinecone_connector_id:
             st.info(f"🔄 Updating Pinecone namespace to: `{namespace}`")
@@ -404,6 +474,24 @@ def trigger_workflow(unstructured_client, workflow_id, namespace=None, pinecone_
             return {'success': True, 'namespace': namespace}
             
     except Exception as e:
+        # Check if it's a rate limit error (429)
+        error_str = str(e)
+        if "429" in error_str or "Rate limit" in error_str:
+            if retry_count < max_retries:
+                logger.warning(f"Rate limit hit, retrying... ({retry_count + 1}/{max_retries})")
+                st.warning(f"⏳ Rate limit hit, retrying in a moment... (Attempt {retry_count + 1}/{max_retries})")
+                return trigger_workflow(
+                    unstructured_client, 
+                    workflow_id, 
+                    namespace, 
+                    pinecone_connector_id, 
+                    retry_count + 1,
+                    max_retries
+                )
+            else:
+                logger.error(f"Max retries reached for rate limiting")
+                st.error(f"❌ Rate limit exceeded after {max_retries} retries. Please wait a moment and try again.")
+        
         # Print workflow error details
         print(f"\n❌ WORKFLOW EXECUTION FAILED")
         print(f"📤 Error Details:")
@@ -626,6 +714,229 @@ def create_gcs_source_connector(client, folder_name, bucket_name):
         
         return {'success': False, 'error': str(e)}
 
+def add_job_to_queue(job_data):
+    """Add a job to Pub/Sub queue with retry logic"""
+    max_retries = 2
+    retry_delay = 1
+    
+    for attempt in range(max_retries):
+        try:
+            publisher = init_pubsub_publisher()
+            if not publisher:
+                raise Exception("Failed to initialize Pub/Sub publisher")
+            
+            # Create topic path
+            topic_path = publisher.topic_path(PUBSUB_PROJECT_ID, PUBSUB_TOPIC)
+            
+            # Serialize job data to JSON bytes
+            message_data = json.dumps(job_data).encode('utf-8')
+            
+            # Publish message with retry
+            future = publisher.publish(topic_path, message_data)
+            message_id = future.result()  # Wait for publish to complete
+            
+            global job_queue_count
+            st.session_state.job_queue_count += 1
+            job_queue_count += 1
+            logger.info(f"Job added to queue: {job_data['filename']} (Message ID: {message_id})")
+            st.success(f"📥 Job added to queue (Position: {st.session_state.job_queue_count})")
+            return True
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Failed to add job to queue (attempt {attempt + 1}/{max_retries}): {e}")
+                time.sleep(retry_delay)
+                continue
+            else:
+                logger.error(f"Failed to add job to queue after retries: {e}")
+                st.warning("⚠️ Queue not available, processing immediately")
+                return False
+    
+    return False
+
+def is_job_running(client):
+    """Check if current job is still running - thread safe version"""
+    global current_job_id, current_job_lock
+    
+    with current_job_lock:
+        # First, check our tracked job
+        if current_job_id:
+            try:
+                job_status = check_job_status(client, current_job_id)
+                if job_status and hasattr(job_status, 'status'):
+                    status = job_status.status.lower()
+                    if status in ['completed', 'failed', 'cancelled', 'finished']:
+                        logger.info(f"Job {current_job_id} completed with status: {status}")
+                        current_job_id = None
+                        return False
+                    return True
+            except Exception as e:
+                logger.error(f"Error checking job status: {e}")
+                # Assume job is not running if we can't check
+                current_job_id = None
+        
+        # Skip platform job check - requires workflow_id parameter
+        # Our current_job_id tracking is sufficient for job management
+        
+        return False
+
+def process_job_from_queue(client, job_data):
+    """Process a single job from the queue"""
+    try:
+        logger.info(f"Processing job: {job_data['filename']}")
+        logger.info(f"Job data: {job_data}")
+        
+        # Trigger workflow
+        logger.info(f"Triggering workflow with ID: {job_data['workflow_id']}, namespace: {job_data.get('namespace')}, connector_id: {job_data.get('connector_id')}")
+        result = trigger_workflow(
+            client,
+            job_data['workflow_id'],
+            job_data.get('namespace'),
+            job_data.get('connector_id')
+        )
+        
+        logger.info(f"Workflow trigger result: {result}")
+        
+        if result and result.get('success') and 'job_id' in result:
+            global current_job_id, current_job_lock
+            with current_job_lock:
+                current_job_id = result['job_id']
+            logger.info(f"Started job: {result['job_id']}")
+            
+            # Monitor job completion in background
+            def monitor_job_completion():
+                """Monitor job completion and clear current_job_id when done"""
+                job_id = result['job_id']
+                max_wait_time = 600  # 10 minutes max wait
+                check_interval = 15  # Check every 15 seconds
+                elapsed_time = 0
+                
+                while elapsed_time < max_wait_time:
+                    try:
+                        time.sleep(check_interval)
+                        elapsed_time += check_interval
+                        
+                        job_status = check_job_status(client, job_id)
+                        if job_status and hasattr(job_status, 'status'):
+                            status = job_status.status.lower()
+                            logger.info(f"Job {job_id} status: {status}")
+                            
+                            if status in ['completed', 'failed', 'cancelled', 'finished']:
+                                with current_job_lock:
+                                    if current_job_id == job_id:
+                                        current_job_id = None
+                                        logger.info(f"Job {job_id} completed with status: {status}")
+                                break
+                    except Exception as e:
+                        logger.error(f"Error monitoring job {job_id}: {e}")
+                        break
+                
+                # Ensure job is cleared after timeout
+                with current_job_lock:
+                    if current_job_id == job_id:
+                        current_job_id = None
+                        logger.warning(f"Job {job_id} monitoring timed out, clearing job status")
+            
+            # Start monitoring in background thread
+            import threading
+            monitor_thread = threading.Thread(target=monitor_job_completion, daemon=True)
+            monitor_thread.start()
+            
+            return True
+        else:
+            # Check if it's a 409 error (job already running)
+            if result and 'error' in result and '409' in str(result['error']):
+                logger.warning(f"Cannot start job for {job_data['filename']} - another job is already running. Will retry later.")
+                # Don't consider this a failure, just return False to keep job in queue
+                return False
+            else:
+                logger.error(f"Failed to start workflow for {job_data['filename']} - Result: {result}")
+                return False
+            
+    except Exception as e:
+        logger.error(f"Error processing job: {e}")
+        return False
+
+def job_consumer():
+    """Pub/Sub subscriber that processes jobs sequentially"""
+    while True:  # Keep running continuously
+        try:
+            subscriber = init_pubsub_subscriber()
+            if not subscriber:
+                logger.error("Failed to initialize Pub/Sub subscriber")
+                time.sleep(10)
+                continue
+            
+            # Create subscription path
+            subscription_path = subscriber.subscription_path(PUBSUB_PROJECT_ID, PUBSUB_SUBSCRIPTION)
+            
+            logger.info(f"Pub/Sub consumer started, listening on: {subscription_path}")
+            
+            def callback(message):
+                """Callback function to process messages"""
+                try:
+                    # Decode message data
+                    job_data = json.loads(message.data.decode('utf-8'))
+                    logger.info(f"Received job from queue: {job_data['filename']}")
+                    
+                    # Get client (this is a simplified approach)
+                    client = init_unstructured_client()
+                    if not client:
+                        logger.error("Failed to initialize Unstructured client")
+                        message.nack()  # Negative acknowledgment - message will be redelivered
+                        return
+                    
+                    # Wait until no job is running
+                    while is_job_running(client):
+                        logger.info("Job currently running, waiting...")
+                        time.sleep(30)
+                    
+                    # Process the job
+                    if process_job_from_queue(client, job_data):
+                        global job_queue_count
+                        job_queue_count = max(0, job_queue_count - 1)
+                        logger.info(f"Job processed successfully: {job_data['filename']}")
+                        message.ack()  # Acknowledge successful processing
+                        # Add 30 second delay between jobs as requested
+                        logger.info("Waiting 30 seconds before processing next job...")
+                        time.sleep(30)
+                    else:
+                        # For 409 errors, we don't decrement the queue count since we'll retry
+                        logger.warning(f"Job processing failed (will retry): {job_data['filename']}")
+                        message.nack()  # Negative acknowledgment - message will be redelivered
+                        time.sleep(10)  # Wait longer before retry
+                        
+                except Exception as e:
+                    logger.error(f"Error processing message: {e}")
+                    message.nack()  # Negative acknowledgment on error
+            
+            # Subscribe to the subscription
+            streaming_pull_future = subscriber.subscribe(subscription_path, callback=callback)
+            logger.info(f"Listening for messages on {subscription_path}...")
+            
+            # Keep the subscriber running
+            try:
+                streaming_pull_future.result()
+            except Exception as e:
+                logger.error(f"Streaming pull error: {e}")
+                streaming_pull_future.cancel()
+                streaming_pull_future.result()  # Wait for cancellation to complete
+            
+        except Exception as e:
+            logger.error(f"Pub/Sub consumer error: {e}, retrying in 10 seconds...")
+            time.sleep(10)
+
+def start_pubsub_consumer():
+    """Start Pub/Sub consumer in background thread"""
+    if not st.session_state.pubsub_consumer_started:
+        try:
+            consumer_thread = threading.Thread(target=job_consumer, daemon=True)
+            consumer_thread.start()
+            st.session_state.pubsub_consumer_started = True
+            logger.info("Pub/Sub consumer thread started")
+        except Exception as e:
+            logger.error(f"Failed to start Pub/Sub consumer: {e}")
+
 def main():
     st.title("📚 PDF Upload & Processing Interface")
     st.markdown("Upload PDFs to your Unstructured workflow for document processing")
@@ -634,6 +945,9 @@ def main():
     client = init_unstructured_client()
     if not client:
         st.stop()
+    
+    # Start Pub/Sub consumer
+    start_pubsub_consumer()
     
     # Sidebar for configuration
     with st.sidebar:
@@ -765,7 +1079,13 @@ def main():
                 for uploaded_file in uploaded_files:
                     file_key = f"{uploaded_file.name}_{uploaded_file.size}"
                     
-                    if file_key not in st.session_state.processed_files:
+                    # Check if file already processed (proper deduplication)
+                    already_processed = any(
+                        f.get('filename') == uploaded_file.name and f.get('size') == uploaded_file.size 
+                        for f in st.session_state.processed_files if isinstance(f, dict)
+                    )
+                    
+                    if not already_processed:
                         with st.spinner(f"Uploading {uploaded_file.name} to GCS..."):
                             # Read file content
                             file_content = uploaded_file.read()
@@ -803,24 +1123,37 @@ def main():
                                 st.session_state.processed_files.append(file_info)
                                 st.session_state.last_upload_time = time.time()
                                 
-                                # Trigger workflow processing
-                                st.info("🔄 Triggering workflow to process uploaded file...")
-                                workflow_result = trigger_workflow(
-                                    client, 
-                                    selected_workflow_id,
-                                    namespace=st.session_state.selected_namespace if st.session_state.selected_namespace != "default" else None,
-                                    pinecone_connector_id=st.session_state.selected_pinecone_connector
-                                )
+                                # Add to Pub/Sub queue instead of immediate trigger
+                                st.info("📥 Adding job to processing queue...")
+                                job_data = {
+                                    'filename': uploaded_file.name,
+                                    'gcs_path': result['blob_name'],
+                                    'bucket': result['bucket'],
+                                    'workflow_id': selected_workflow_id,
+                                    'namespace': st.session_state.selected_namespace if st.session_state.selected_namespace != "default" else None,
+                                    'connector_id': st.session_state.selected_pinecone_connector,
+                                    'uploaded_at': time.time()
+                                }
                                 
-                                if workflow_result and workflow_result.get('success'):
-                                    st.success("🎉 Workflow triggered! File processing has started.")
-                                    if 'job_id' in workflow_result:
-                                        # Store job ID and namespace for later tracking
-                                        file_info['job_id'] = workflow_result['job_id']
-                                        file_info['namespace'] = workflow_result.get('namespace', 'default')
-                                        st.session_state.processed_files[-1] = file_info  # Update the stored file info
+                                if add_job_to_queue(job_data):
+                                    st.success("🎉 File uploaded and added to processing queue!")
+                                    # Store job info for tracking
+                                    file_info['queued_at'] = time.time()
+                                    file_info['namespace'] = job_data.get('namespace', 'default')
+                                    st.session_state.processed_files[-1] = file_info  # Update the stored file info
                                 else:
-                                    st.warning("⚠️ Workflow trigger failed, but file upload successful. Workflow may still auto-detect the file.")
+                                    # Fallback to direct workflow trigger
+                                    st.info("🔄 Processing workflow directly...")
+                                    workflow_result = trigger_workflow(
+                                        client, 
+                                        selected_workflow_id,
+                                        namespace=st.session_state.selected_namespace if st.session_state.selected_namespace != "default" else None,
+                                        pinecone_connector_id=st.session_state.selected_pinecone_connector
+                                    )
+                                    if workflow_result and workflow_result.get('success'):
+                                        st.success("🎉 Workflow triggered directly!")
+                                    else:
+                                        st.warning("⚠️ Workflow trigger failed")
                             else:
                                 st.error(f"❌ Failed to upload {uploaded_file.name}")
             
@@ -987,6 +1320,18 @@ def main():
     # Main status and monitoring interface
     st.header("📊 Status & Monitoring")
     
+    # Add auto-refresh for real-time updates
+    if st.button("🔄 Refresh Status", help="Click to refresh current job status"):
+        st.rerun()
+    
+    # Auto-refresh every 30 seconds if there are active jobs
+    global current_job_id, current_job_lock
+    with current_job_lock:
+        if current_job_id:
+            st.info("⏱️ Auto-refreshing every 30 seconds while job is running...")
+            time.sleep(1)  # Small delay to prevent rapid refreshes
+            st.rerun()
+    
     # Show custom folder status
     if st.session_state.custom_folder_name or st.session_state.created_source_connector:
         st.subheader("📁 Custom Folder Configuration")
@@ -1008,11 +1353,27 @@ def main():
         
         st.divider()
     
-    # Show upload status
-    if st.session_state.processed_files:
-        st.metric("Processed Files", len(st.session_state.processed_files))
-    else:
-        st.info("No files uploaded yet")
+    # Show queue and job status
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.session_state.processed_files:
+            st.metric("Processed Files", len(st.session_state.processed_files))
+        else:
+            st.metric("Processed Files", 0)
+    
+    with col2:
+        st.metric("Jobs in Queue", st.session_state.job_queue_count)
+    
+    with col3:
+        # Sync global state with session state for display  
+        with current_job_lock:
+            active_job_id = current_job_id
+            st.session_state.job_queue_count = job_queue_count
+        
+        if active_job_id:
+            st.metric("Current Job", "Running", delta=f"ID: {active_job_id[:8]}...")
+        else:
+            st.metric("Current Job", "None")
     
     # Workflow status
     st.subheader("🔧 Workflow Info")
@@ -1028,15 +1389,17 @@ def main():
     2. **Create Custom Folder** (optional) with datetime suffix
     3. **Create GCS Source Connector** for custom folder monitoring
     4. **Upload PDFs** to Google Cloud Storage in custom folder
-    5. **Workflow monitors** custom folder automatically
-    6. **Documents processed** and stored in Pinecone
-    7. **Processing ready** once upload completes
+    5. **Jobs added to Pub/Sub queue** for sequential processing
+    6. **Queue processor monitors** and runs workflows one at a time
+    7. **Documents processed** and stored in Pinecone
+    8. **Processing completed** when queue is empty
     
-    **📁 Custom Folder Benefits:**
-    - **Organized storage** with timestamp-based folders
-    - **Dedicated source connectors** for specific folders
-    - **Automatic workflow monitoring** of custom paths
-    - **Global folder name** stored for consistent use
+    **🔄 Queue-Based Processing Benefits:**
+    - **Sequential execution** - only one workflow runs at a time
+    - **Reliable queuing** - GCP Pub/Sub handles job persistence
+    - **Status monitoring** - track current job and queue length
+    - **No conflicts** - prevents workflow interference
+    - **Scalable** - can handle multiple rapid uploads
     """)
     
     # Troubleshooting section
