@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Depends, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
@@ -541,16 +541,15 @@ async def list_pinecone_connectors():
 async def upload_pdf(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    namespace: Optional[str] = None,
-    workflow_id: Optional[str] = None,
-    custom_folder: Optional[str] = None
+    namespace: Optional[str] = Form(None),
+    workflow_id: Optional[str] = Form(None),
+    custom_folder: Optional[str] = Form(None)
 ):
     """Upload a PDF file and trigger workflow processing"""
     
     # Log user request data
     logger.info(f"\n=== UPLOAD REQUEST RECEIVED ===")
     logger.info(f"📥 User Request Details:")
-    # logger.info(f"   • Request: {request}")
     logger.info(f"   • Filename: {file.filename}")
     logger.info(f"   • File Size: {file.size if hasattr(file, 'size') else 'Unknown'} bytes")
     logger.info(f"   • Content Type: {file.content_type}")
