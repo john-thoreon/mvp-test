@@ -1,0 +1,29 @@
+# FastAPI and server dependencies
+fastapi==0.118.0
+uvicorn[standard]==0.37.0
+python-multipart==0.0.20
+
+# Pydantic for data validation
+pydantic>=2.11.9
+
+# Google Cloud dependencies
+google-cloud-storage==3.4.0
+google-cloud-pubsub==2.31.1
+google-auth==2.41.1
+google-auth-oauthlib==1.2.2
+
+# Unstructured client
+unstructured-client>=0.42.3
+
+# Environment and utilities
+python-dotenv==1.1.1
+requests==2.32.5
+
+# Logging and monitoring
+structlog==25.4.0
+
+# Development dependencies (optional)
+pytest==8.4.2
+pytest-asyncio==1.2.0
+black==25.9.0
+flake8==7.3.0
