@@ -215,6 +215,8 @@ def trigger_workflow(unstructured_client, workflow_id: str, namespace: Optional[
         # If namespace is provided, update the Pinecone connector first
         if namespace and pinecone_connector_id:
             logger.info(f"🔄 Updating Pinecone namespace to: `{namespace}`")
+            logger.info(f"   • Connector ID: {pinecone_connector_id}")
+            logger.info(f"   • Target Namespace: {namespace}")
             namespace_result = update_pinecone_namespace(
                 unstructured_client, 
                 pinecone_connector_id, 
@@ -223,8 +225,13 @@ def trigger_workflow(unstructured_client, workflow_id: str, namespace: Optional[
             
             if not namespace_result.get('success'):
                 logger.warning("⚠️ Namespace update failed, proceeding with current namespace")
+                logger.warning(f"   • Error: {namespace_result.get('error', 'Unknown error')}")
             else:
                 logger.info(f"✅ Namespace updated to: `{namespace}`")
+        elif namespace and not pinecone_connector_id:
+            logger.warning(f"⚠️ Namespace '{namespace}' provided but no Pinecone connector found")
+        elif not namespace:
+            logger.info("ℹ️ No namespace provided, using default Pinecone namespace")
         
         logger.info(f"Triggering workflow {workflow_id}")
         
@@ -540,6 +547,18 @@ async def upload_pdf(
 ):
     """Upload a PDF file and trigger workflow processing"""
     
+    # Log user request data
+    logger.info(f"\n=== UPLOAD REQUEST RECEIVED ===")
+    logger.info(f"📥 User Request Details:")
+    logger.info(f"   • Filename: {file.filename}")
+    logger.info(f"   • File Size: {file.size if hasattr(file, 'size') else 'Unknown'} bytes")
+    logger.info(f"   • Content Type: {file.content_type}")
+    logger.info(f"   • Namespace: {namespace}")
+    logger.info(f"   • Workflow ID: {workflow_id}")
+    logger.info(f"   • Custom Folder: {custom_folder}")
+    logger.info(f"   • Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"=== END REQUEST DETAILS ===\n")
+    
     # Validate file type
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
@@ -596,20 +615,25 @@ async def upload_pdf(
         
         # Get Pinecone connector ID if namespace is provided
         pinecone_connector_id = None
-        if namespace and namespace != "default":
+        if namespace:  # Changed: Remove the "!= default" check
             try:
                 pinecone_connectors = get_pinecone_connectors(client)
                 if pinecone_connectors:
                     pinecone_connector_id = pinecone_connectors[0].id
                     logger.info(f"Using Pinecone connector: {pinecone_connector_id}")
+                    logger.info(f"Will update namespace to: {namespace}")
+                else:
+                    logger.warning("No Pinecone connectors found")
             except Exception as e:
                 logger.warning(f"Could not get Pinecone connector: {e}")
+        else:
+            logger.info("No namespace provided, using default Pinecone namespace")
         
         # Trigger workflow
         workflow_result = trigger_workflow(
             client, 
             workflow_id, 
-            namespace=namespace if namespace != "default" else None,
+            namespace=namespace,  # Changed: Always pass namespace if provided
             pinecone_connector_id=pinecone_connector_id
         )
         
@@ -628,6 +652,19 @@ async def upload_pdf(
             logger.info(f"Job also added to monitoring queue for {file.filename}")
         except Exception as e:
             logger.warning(f"Could not add job to queue (not critical): {e}")
+        
+        # Log final response details
+        logger.info(f"\n=== UPLOAD RESPONSE ===")
+        logger.info(f"📤 Response Details:")
+        logger.info(f"   • Success: True")
+        logger.info(f"   • Filename: {file.filename}")
+        logger.info(f"   • GCS Path: {upload_result['blob_name']}")
+        logger.info(f"   • Bucket: {upload_result['bucket']}")
+        logger.info(f"   • Size: {upload_result['size']} bytes")
+        logger.info(f"   • Job ID: {job_id}")
+        logger.info(f"   • Workflow ID: {workflow_id}")
+        logger.info(f"   • Namespace Used: {namespace}")
+        logger.info(f"=== END RESPONSE ===\n")
         
         return UploadResponse(
             success=True,
@@ -663,19 +700,22 @@ async def trigger_workflow_manually(
     
     # Get Pinecone connector ID if namespace is provided
     pinecone_connector_id = None
-    if namespace and namespace != "default":
+    if namespace:  # Changed: Remove the "!= default" check
         try:
             pinecone_connectors = get_pinecone_connectors(client)
             if pinecone_connectors:
                 pinecone_connector_id = pinecone_connectors[0].id
                 logger.info(f"Using Pinecone connector: {pinecone_connector_id}")
+                logger.info(f"Will update namespace to: {namespace}")
         except Exception as e:
             logger.warning(f"Could not get Pinecone connector: {e}")
+    else:
+        logger.info("No namespace provided, using default Pinecone namespace")
     
     result = trigger_workflow(
         client, 
         workflow_id, 
-        namespace=namespace if namespace != "default" else None,
+        namespace=namespace,  # Changed: Always pass namespace if provided
         pinecone_connector_id=pinecone_connector_id
     )
     
