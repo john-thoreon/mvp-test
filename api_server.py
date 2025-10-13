@@ -88,7 +88,7 @@ def get_unstructured_client():
     """Get or initialize Unstructured client"""
     global _unstructured_client
     if _unstructured_client is None:
-        api_key = "KiAnnFqyif3OdsjIMhcSqwDLJARilJ"
+        api_key = os.getenv("UNSTRUCTURED_API_KEY")
         if not api_key:
             raise HTTPException(status_code=500, detail="UNSTRUCTURED_API_KEY not found")
         _unstructured_client = UnstructuredClient(api_key_auth=api_key)
