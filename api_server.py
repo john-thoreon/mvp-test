@@ -64,7 +64,7 @@ class UploadResponse(BaseModel):
     size: int
     job_id: Optional[str] = None
     workflow_id: str
-    namespace: Optional[str] = None
+    namespace: str
     message: str
 
 class JobStatus(BaseModel):
@@ -550,6 +550,7 @@ async def upload_pdf(
     # Log user request data
     logger.info(f"\n=== UPLOAD REQUEST RECEIVED ===")
     logger.info(f"📥 User Request Details:")
+    logger.info(f"   • Request: {request}")
     logger.info(f"   • Filename: {file.filename}")
     logger.info(f"   • File Size: {file.size if hasattr(file, 'size') else 'Unknown'} bytes")
     logger.info(f"   • Content Type: {file.content_type}")
