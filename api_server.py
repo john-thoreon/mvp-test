@@ -550,7 +550,7 @@ async def upload_pdf(
     # Log user request data
     logger.info(f"\n=== UPLOAD REQUEST RECEIVED ===")
     logger.info(f"📥 User Request Details:")
-    logger.info(f"   • Request: {request}")
+    # logger.info(f"   • Request: {request}")
     logger.info(f"   • Filename: {file.filename}")
     logger.info(f"   • File Size: {file.size if hasattr(file, 'size') else 'Unknown'} bytes")
     logger.info(f"   • Content Type: {file.content_type}")
