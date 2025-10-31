@@ -1,5 +1,5 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Depends, Form
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Depends, Form, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import os
@@ -9,6 +9,7 @@ import json
 import logging
 import threading
 import base64
+import asyncio
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
@@ -21,6 +22,10 @@ from unstructured_client.models.operations import (
     ListDestinationsRequest, UpdateDestinationRequest
 )
 from unstructured_client.models.shared import UpdateDestinationConnector
+import websockets
+
+# Import our service classes
+from services import TwilioService, OpenAIService, PineconeService, RAGService
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -42,6 +47,19 @@ PUBSUB_TOPIC = os.getenv("PUBSUB_TOPIC", "workflow-jobs")
 PUBSUB_SUBSCRIPTION = os.getenv("PUBSUB_SUBSCRIPTION", "workflow-jobs-sub")
 PUBSUB_CREDENTIALS_PATH = os.getenv("GCP_PUB_SUB_CREDENTIALS")
 PUBSUB_CREDENTIALS_BASE64 = os.getenv("GCP_PUB_SUB_CREDENTIALS_BASE64")
+
+# Twilio configuration
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
+
+# OpenAI configuration (for Real-time API and embeddings)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Pinecone configuration
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
+PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT")
 
 # Global job state - thread safe
 current_job_lock = threading.Lock()
@@ -78,11 +96,34 @@ class ApiError(BaseModel):
     error: str
     details: Optional[str] = None
 
-# Cached clients
+class CallRequest(BaseModel):
+    phone_number: str
+    namespace: str
+    initial_message: Optional[str] = "Hello, how can I help you today?"
+
+class AlertCallRequest(BaseModel):
+    phone_number: str
+    message: str
+
+class CallResponse(BaseModel):
+    success: bool
+    call_sid: str
+    phone_number: str
+    status: str
+    message: str
+    namespace: Optional[str] = None
+
+# Cached clients (existing GCP and Unstructured)
 _unstructured_client = None
 _gcs_client = None
 _pubsub_publisher = None
 _pubsub_subscriber = None
+
+# Cached service instances (new OOP approach)
+_twilio_service = None
+_openai_service = None
+_pinecone_service = None
+_rag_service = None
 
 def get_unstructured_client():
     """Get or initialize Unstructured client"""
@@ -144,6 +185,83 @@ def get_pubsub_publisher():
             raise HTTPException(status_code=500, detail=f"Pub/Sub initialization failed: {e}")
     
     return _pubsub_publisher
+
+def get_twilio_service() -> TwilioService:
+    """Get or initialize Twilio service"""
+    global _twilio_service
+    if _twilio_service is None:
+        try:
+            if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_PHONE_NUMBER:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Twilio credentials not configured (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER)"
+                )
+            _twilio_service = TwilioService(
+                account_sid=TWILIO_ACCOUNT_SID,
+                auth_token=TWILIO_AUTH_TOKEN,
+                phone_number=TWILIO_PHONE_NUMBER
+            )
+            logger.info("Twilio service initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing Twilio service: {e}")
+            raise HTTPException(status_code=500, detail=f"Twilio initialization failed: {e}")
+    
+    return _twilio_service
+
+def get_openai_service() -> OpenAIService:
+    """Get or initialize OpenAI service"""
+    global _openai_service
+    if _openai_service is None:
+        try:
+            if not OPENAI_API_KEY:
+                raise HTTPException(status_code=500, detail="OPENAI_API_KEY not found")
+            _openai_service = OpenAIService(api_key=OPENAI_API_KEY)
+            logger.info("OpenAI service initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing OpenAI service: {e}")
+            raise HTTPException(status_code=500, detail=f"OpenAI initialization failed: {e}")
+    
+    return _openai_service
+
+def get_pinecone_service() -> PineconeService:
+    """Get or initialize Pinecone service"""
+    global _pinecone_service
+    if _pinecone_service is None:
+        try:
+            if not PINECONE_API_KEY or not PINECONE_INDEX_NAME:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Pinecone credentials not configured (PINECONE_API_KEY, PINECONE_INDEX_NAME)"
+                )
+            _pinecone_service = PineconeService(
+                api_key=PINECONE_API_KEY,
+                index_name=PINECONE_INDEX_NAME,
+                environment=PINECONE_ENVIRONMENT
+            )
+            logger.info("Pinecone service initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing Pinecone service: {e}")
+            raise HTTPException(status_code=500, detail=f"Pinecone initialization failed: {e}")
+    
+    return _pinecone_service
+
+def get_rag_service() -> RAGService:
+    """Get or initialize RAG service"""
+    global _rag_service
+    if _rag_service is None:
+        try:
+            openai_service = get_openai_service()
+            pinecone_service = get_pinecone_service()
+            _rag_service = RAGService(
+                openai_service=openai_service,
+                pinecone_service=pinecone_service
+            )
+            logger.info("RAG service initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing RAG service: {e}")
+            raise HTTPException(status_code=500, detail=f"RAG initialization failed: {e}")
+    
+    return _rag_service
 
 # Core functions from simple_app.py
 def get_workflows(client):
@@ -481,6 +599,32 @@ def check_workflow_jobs(client, workflow_id: str, limit: int = 10):
         logger.error(f"Error checking jobs: {e}")
         return []
 
+# Twilio AI Calling Functions (now using services)
+
+async def query_pinecone_context(query_text: str, namespace: str, top_k: int = 5) -> str:
+    """
+    Query Pinecone for relevant context using RAG.
+    This is a wrapper around RAGService for backward compatibility.
+    
+    Args:
+        query_text: The text to search for
+        namespace: Pinecone namespace to search in
+        top_k: Number of results to retrieve
+        
+    Returns:
+        Formatted context string from top results
+    """
+    try:
+        rag_service = get_rag_service()
+        return await rag_service.query_context(
+            query_text=query_text,
+            namespace=namespace,
+            top_k=top_k
+        )
+    except Exception as e:
+        logger.error(f"Error in query_pinecone_context: {e}")
+        return f"Error retrieving context: {str(e)}"
+
 # API Routes
 @app.get("/")
 async def root():
@@ -789,6 +933,343 @@ async def get_system_status():
         "jobs_in_queue": queue_count,
         "timestamp": datetime.now().isoformat()
     }
+
+# Twilio AI Calling Endpoints
+
+@app.post("/call/interactive", response_model=CallResponse)
+async def initiate_interactive_call(
+    call_request: CallRequest,
+    background_tasks: BackgroundTasks,
+    request: Request
+):
+    """
+    Initiate an interactive AI call with RAG support
+    
+    Args:
+        call_request: Call parameters including phone_number, namespace, initial_message
+        background_tasks: FastAPI background tasks
+        request: Request object to get base URL
+        
+    Returns:
+        CallResponse with call details
+    """
+    try:
+        logger.info(f"\n=== INTERACTIVE CALL REQUEST ===")
+        logger.info(f"Phone Number: {call_request.phone_number}")
+        logger.info(f"Namespace: {call_request.namespace}")
+        logger.info(f"Initial Message: {call_request.initial_message}")
+        
+        # Validate phone number format
+        phone = call_request.phone_number.strip()
+        twilio_service = get_twilio_service()
+        
+        if not twilio_service.validate_phone_number(phone):
+            raise HTTPException(status_code=400, detail="Phone number must be in E.164 format (start with +)")
+        
+        # Build WebSocket URL (use request base URL for production)
+        base_url = str(request.base_url).rstrip('/')
+        ws_url = base_url.replace('http://', 'ws://').replace('https://', 'wss://')
+        websocket_url = f"{ws_url}/ws/twilio-stream"
+        
+        logger.info(f"WebSocket URL: {websocket_url}")
+        
+        # Generate TwiML using service
+        twiml = twilio_service.generate_interactive_twiml(websocket_url, call_request.namespace)
+        
+        # Initiate call using service
+        call_result = twilio_service.initiate_call(
+            to_number=phone,
+            twiml=twiml,
+            status_callback_url=f"{base_url}/webhooks/twilio/call-status"
+        )
+        
+        logger.info(f"Call initiated - SID: {call_result['call_sid']}, Status: {call_result['status']}")
+        logger.info(f"=== END CALL REQUEST ===\n")
+        
+        return CallResponse(
+            success=True,
+            call_sid=call_result['call_sid'],
+            phone_number=phone,
+            status=call_result['status'],
+            message="Interactive call initiated successfully",
+            namespace=call_request.namespace
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error initiating interactive call: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to initiate call: {str(e)}")
+
+@app.post("/call/alert", response_model=CallResponse)
+async def initiate_alert_call(
+    alert_request: AlertCallRequest,
+    background_tasks: BackgroundTasks,
+    request: Request
+):
+    """
+    Initiate a simple alert call that plays a message and hangs up
+    
+    Args:
+        alert_request: Alert parameters including phone_number and message
+        background_tasks: FastAPI background tasks
+        request: Request object to get base URL
+        
+    Returns:
+        CallResponse with call details
+    """
+    try:
+        logger.info(f"\n=== ALERT CALL REQUEST ===")
+        logger.info(f"Phone Number: {alert_request.phone_number}")
+        logger.info(f"Message: {alert_request.message}")
+        
+        # Validate phone number format
+        phone = alert_request.phone_number.strip()
+        twilio_service = get_twilio_service()
+        
+        if not twilio_service.validate_phone_number(phone):
+            raise HTTPException(status_code=400, detail="Phone number must be in E.164 format (start with +)")
+        
+        # Generate TwiML for alert using service
+        twiml = twilio_service.generate_alert_twiml(alert_request.message)
+        
+        # Build callback URL
+        base_url = str(request.base_url).rstrip('/')
+        
+        # Initiate call using service
+        call_result = twilio_service.initiate_call(
+            to_number=phone,
+            twiml=twiml,
+            status_callback_url=f"{base_url}/webhooks/twilio/call-status"
+        )
+        
+        logger.info(f"Alert call initiated - SID: {call_result['call_sid']}, Status: {call_result['status']}")
+        logger.info(f"=== END ALERT CALL REQUEST ===\n")
+        
+        return CallResponse(
+            success=True,
+            call_sid=call_result['call_sid'],
+            phone_number=phone,
+            status=call_result['status'],
+            message="Alert call initiated successfully"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error initiating alert call: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to initiate alert call: {str(e)}")
+
+@app.get("/call/status/{call_sid}")
+async def get_call_status_endpoint(call_sid: str):
+    """
+    Get the status of a specific call
+    
+    Args:
+        call_sid: Twilio call SID
+        
+    Returns:
+        Call status information
+    """
+    try:
+        twilio_service = get_twilio_service()
+        status = twilio_service.get_call_status(call_sid)
+        return status
+        
+    except Exception as e:
+        logger.error(f"Error fetching call status: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch call status: {str(e)}")
+
+@app.post("/webhooks/twilio/call-status")
+async def twilio_call_status_callback(request: Request):
+    """
+    Webhook to receive call status updates from Twilio
+    
+    Args:
+        request: Request containing Twilio callback data
+        
+    Returns:
+        Success acknowledgment
+    """
+    try:
+        form_data = await request.form()
+        call_sid = form_data.get('CallSid')
+        call_status = form_data.get('CallStatus')
+        from_number = form_data.get('From')
+        to_number = form_data.get('To')
+        duration = form_data.get('CallDuration')
+        
+        logger.info(f"\n=== TWILIO CALL STATUS UPDATE ===")
+        logger.info(f"Call SID: {call_sid}")
+        logger.info(f"Status: {call_status}")
+        logger.info(f"From: {from_number}")
+        logger.info(f"To: {to_number}")
+        logger.info(f"Duration: {duration} seconds")
+        logger.info(f"=== END STATUS UPDATE ===\n")
+        
+        # Optional: Publish to Pub/Sub or store in database
+        try:
+            status_data = {
+                'call_sid': call_sid,
+                'status': call_status,
+                'from': from_number,
+                'to': to_number,
+                'duration': duration,
+                'timestamp': datetime.now().isoformat()
+            }
+            # Could publish to Pub/Sub here if needed
+            # add_job_to_queue(status_data)
+        except Exception as e:
+            logger.warning(f"Could not publish status update: {e}")
+        
+        return {"success": True}
+        
+    except Exception as e:
+        logger.error(f"Error processing Twilio callback: {e}")
+        return {"success": False, "error": str(e)}
+
+# WebSocket endpoint for Twilio Media Streams with OpenAI Real-time API
+
+@app.websocket("/ws/twilio-stream")
+async def twilio_media_stream(websocket: WebSocket):
+    """
+    WebSocket endpoint for Twilio Media Streams
+    Handles bidirectional audio streaming with OpenAI Real-time API and Pinecone RAG
+    """
+    await websocket.accept()
+    
+    logger.info("Twilio WebSocket connection accepted")
+    
+    # Extract namespace from query parameters
+    namespace = websocket.query_params.get('namespace', 'default')
+    logger.info(f"Using Pinecone namespace: {namespace}")
+    
+    # Connection state
+    openai_ws = None
+    stream_sid = None
+    call_sid = None
+    
+    try:
+        # Get services
+        openai_service = get_openai_service()
+        rag_service = get_rag_service()
+        
+        # Configure and connect to OpenAI Real-time API using service
+        session_config = openai_service.get_default_session_config(
+            instructions="You are a helpful AI assistant. Use the provided context from the knowledge base to answer questions accurately. If you don't find relevant information in the context, say so honestly.",
+            voice="alloy",
+            temperature=0.7
+        )
+        
+        openai_ws = await openai_service.connect_realtime_api(session_config)
+        logger.info("OpenAI session configured")
+        
+        # Task for receiving from Twilio and sending to OpenAI
+        async def twilio_to_openai():
+            nonlocal stream_sid, call_sid
+            try:
+                async for message in websocket.iter_text():
+                    data = json.loads(message)
+                    event_type = data.get('event')
+                    
+                    if event_type == 'start':
+                        stream_sid = data['start']['streamSid']
+                        call_sid = data['start']['callSid']
+                        logger.info(f"Stream started - StreamSID: {stream_sid}, CallSID: {call_sid}")
+                        
+                    elif event_type == 'media':
+                        # Forward audio to OpenAI using service
+                        media_payload = data['media']['payload']
+                        await openai_service.send_audio_to_realtime(openai_ws, media_payload)
+                        
+                    elif event_type == 'stop':
+                        logger.info(f"Stream stopped - StreamSID: {stream_sid}")
+                        break
+                        
+            except WebSocketDisconnect:
+                logger.info("Twilio WebSocket disconnected")
+            except Exception as e:
+                logger.error(f"Error in twilio_to_openai: {e}")
+        
+        # Task for receiving from OpenAI and sending to Twilio
+        async def openai_to_twilio():
+            try:
+                last_transcript = ""
+                
+                async for message in openai_ws:
+                    data = json.loads(message)
+                    event_type = data.get('type')
+                    
+                    # Handle audio responses from OpenAI
+                    if event_type == 'response.audio.delta':
+                        audio_delta = data.get('delta')
+                        if audio_delta:
+                            # Send audio to Twilio
+                            media_message = {
+                                "event": "media",
+                                "streamSid": stream_sid,
+                                "media": {
+                                    "payload": audio_delta
+                                }
+                            }
+                            await websocket.send_json(media_message)
+                    
+                    # Handle transcripts for RAG queries
+                    elif event_type == 'conversation.item.input_audio_transcription.completed':
+                        transcript = data.get('transcript', '')
+                        if transcript and transcript != last_transcript:
+                            last_transcript = transcript
+                            logger.info(f"User said: {transcript}")
+                            
+                            # Query Pinecone for context using RAG service
+                            try:
+                                context = await rag_service.query_context(
+                                    query_text=transcript,
+                                    namespace=namespace,
+                                    top_k=5
+                                )
+                                logger.info(f"Retrieved context from Pinecone (length: {len(context)})")
+                                
+                                # Inject context into conversation using service
+                                if context and "No relevant context" not in context:
+                                    await openai_service.inject_context_to_conversation(openai_ws, context)
+                                    
+                            except Exception as e:
+                                logger.error(f"Error querying Pinecone: {e}")
+                    
+                    # Handle response completion
+                    elif event_type == 'response.done':
+                        logger.info("Response completed")
+                    
+                    # Handle errors
+                    elif event_type == 'error':
+                        error_info = data.get('error', {})
+                        logger.error(f"OpenAI error: {error_info}")
+                        
+            except Exception as e:
+                logger.error(f"Error in openai_to_twilio: {e}")
+        
+        # Run both tasks concurrently
+        await asyncio.gather(
+            twilio_to_openai(),
+            openai_to_twilio()
+        )
+        
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+    finally:
+        # Clean up
+        if openai_ws:
+            await openai_ws.close()
+            logger.info("OpenAI WebSocket closed")
+        
+        try:
+            await websocket.close()
+            logger.info("Twilio WebSocket closed")
+        except:
+            pass
+        
+        logger.info(f"WebSocket session ended - CallSID: {call_sid}")
 
 # Exception handlers
 @app.exception_handler(HTTPException)
