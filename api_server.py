@@ -28,6 +28,7 @@ import websockets
 
 # Import our service classes
 from services import TwilioService, OpenAIService, PineconeService, RAGService
+from services.langchain_service import get_langchain_service
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -1200,7 +1201,13 @@ async def initiate_interactive_call(
             }
             ws_params.append(f"context_id={context_id}")
         
-        websocket_url = f"{ws_url}/ws/twilio-stream?{'&'.join(ws_params)}"
+        # Use path parameter instead of query parameter for better Twilio compatibility
+        if call_request.context_text:
+            websocket_url = f"{ws_url}/ws/twilio-stream/{context_id}"
+        elif call_request.namespace:
+            websocket_url = f"{ws_url}/ws/twilio-stream/namespace/{call_request.namespace}"
+        else:
+            websocket_url = f"{ws_url}/ws/twilio-stream"
         
         logger.info(f"WebSocket URL: {websocket_url}")
         
@@ -1376,8 +1383,8 @@ async def twilio_call_status_callback(request: Request):
 
 # WebSocket endpoint for Twilio Media Streams with OpenAI Real-time API
 
-@app.websocket("/ws/twilio-stream")
-async def twilio_media_stream(websocket: WebSocket):
+@app.websocket("/ws/twilio-stream/{context_id:path}")
+async def twilio_media_stream(websocket: WebSocket, context_id: str = None):
     """
     WebSocket endpoint for Twilio Media Streams
     Handles bidirectional audio streaming with OpenAI Real-time API and Pinecone RAG
@@ -1388,9 +1395,12 @@ async def twilio_media_stream(websocket: WebSocket):
     logger.info("🔵 TWILIO WEBSOCKET CONNECTION ACCEPTED")
     logger.info("=" * 80)
     
-    # Extract parameters from query parameters
-    namespace = websocket.query_params.get('namespace')
-    context_id = websocket.query_params.get('context_id')
+    # Context ID comes from path parameter now
+    # Check if it's a namespace path (starts with "namespace/")
+    namespace = None
+    if context_id and context_id.startswith("namespace/"):
+        namespace = context_id.replace("namespace/", "")
+        context_id = None
     
     logger.info(f"📋 Configuration:")
     logger.info(f"   - Namespace: {namespace or 'None (using direct context)'}")
@@ -1433,19 +1443,16 @@ When the conversation starts, begin by saying: "{initial_greeting}"
 This should be your FIRST message to introduce the conversation.
 """
             
-            instructions = f"""You are a helpful AI assistant designed to answer questions based on the provided context.
+            instructions = f"""You are a friendly conversational AI assistant. You help users understand and explore their data by having natural conversations.
 
 IMPORTANT INSTRUCTIONS:
-1. Your PRIMARY TASK is to answer questions using ONLY the information provided in the context below.
-2. Be accurate, clear, and concise in your responses.
-3. If a question cannot be answered using the provided context, say: "I don't have that specific information in the context provided."
-4. Do not make up information or provide answers that are not supported by the context.
-5. You can have a natural conversation, but always base your answers on the context.
+1. Be conversational and friendly in your responses
+2. When you receive data analysis from the system, present it naturally in your own words
+3. Ask clarifying questions if the user's request is unclear
+4. Keep responses concise for voice conversation (2-4 sentences typically)
+5. If you get data from the system, always relay it to the user clearly
 {greeting_instruction}
-CONTEXT:
-{direct_context}
-
-Remember: Always answer based on the context above. If the information is not in the context, be honest about it.
+The system will provide you with accurate data analysis based on the user's questions. Your job is to present this information conversationally and help the user explore the data naturally.
 """
         else:
             instructions = """You are a helpful AI assistant with access to a knowledge base.
@@ -1460,90 +1467,7 @@ IMPORTANT INSTRUCTIONS:
         
         # Configure and connect to OpenAI Real-time API using service
         # Note: Twilio uses g711_ulaw format which is native for phone calls
-        
-        # Define function tools for context analysis (only if direct_context is provided)
-        tools = []
-        if direct_context:
-            tools = [
-                {
-                    "type": "function",
-                    "name": "get_summary",
-                    "description": "Get a summary from the provided context data. Use this when the user asks for a summary, overview, totals, or general information about the data.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "aspect": {
-                                "type": "string",
-                                "description": "The specific aspect to summarize",
-                                "enum": ["overall", "by_site", "by_type", "by_subject"]
-                            }
-                        },
-                        "required": ["aspect"]
-                    }
-                },
-                {
-                    "type": "function",
-                    "name": "search_context",
-                    "description": "Search for specific information in the context. Use this when the user asks about specific subjects, sites, types, or other specific data points.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "The search term or subject ID to find in the context (e.g., 'subject 1101-0002', 'site 2102', 'visit window')"
-                            },
-                            "search_type": {
-                                "type": "string",
-                                "description": "The type of search",
-                                "enum": ["subject", "site", "type", "general"]
-                            }
-                        },
-                        "required": ["query"]
-                    }
-                },
-                {
-                    "type": "function",
-                    "name": "get_specific_deviation",
-                    "description": "Get detailed information about specific deviations. Use when user asks about a particular subject, site, or deviation type.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "subject_id": {
-                                "type": "string",
-                                "description": "The subject ID to look up (e.g., '1101-0002')"
-                            },
-                            "site_id": {
-                                "type": "string",
-                                "description": "The site ID to look up (e.g., '1101', '2102')"
-                            },
-                            "deviation_type": {
-                                "type": "string",
-                                "description": "The type of deviation (e.g., 'visit window', 'missing assessment', 'incorrect dosing')"
-                            }
-                        }
-                    }
-                },
-                {
-                    "type": "function",
-                    "name": "count_and_filter",
-                    "description": "Count or filter data by specific criteria. Use when user asks 'how many', 'count', 'list all', or wants filtered data.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "filter_type": {
-                                "type": "string",
-                                "description": "What to count or filter",
-                                "enum": ["subjects", "sites", "deviations", "major", "minor", "critical"]
-                            },
-                            "filter_value": {
-                                "type": "string",
-                                "description": "Optional specific value to filter by"
-                            }
-                        },
-                        "required": ["filter_type"]
-                    }
-                }
-            ]
+        # We use LangChain for intelligent question answering instead of function tools
         
         session_config = {
             "type": "session.update",
@@ -1567,11 +1491,8 @@ IMPORTANT INSTRUCTIONS:
             }
         }
         
-        # Add tools if we have direct context
-        if tools:
-            session_config["session"]["tools"] = tools
-            session_config["session"]["tool_choice"] = "auto"
-            logger.info(f"   - Function tools enabled: {len(tools)} tools")
+        if direct_context:
+            logger.info(f"   - LangChain QA enabled for context-based answering")
         
         openai_ws = await openai_service.connect_realtime_api(session_config)
         logger.info("✅ OpenAI Realtime API session configured successfully")
@@ -1719,54 +1640,42 @@ IMPORTANT INSTRUCTIONS:
                                     import traceback
                                     logger.error(traceback.format_exc())
                             elif direct_context:
-                                # Using direct context - it's already in the system instructions
-                                logger.info(f"ℹ️ Using direct context (already in system instructions)")
-                    
-                    # Handle function calls
-                    elif event_type == 'response.function_call_arguments.done':
-                        function_call_id = data.get('call_id')
-                        function_name = data.get('name')
-                        function_args_str = data.get('arguments', '{}')
-                        
-                        try:
-                            function_args = json.loads(function_args_str)
-                        except json.JSONDecodeError:
-                            function_args = {}
-                        
-                        logger.info("=" * 80)
-                        logger.info(f"🔧 FUNCTION CALL")
-                        logger.info(f"   - Function: {function_name}")
-                        logger.info(f"   - Arguments: {function_args}")
-                        logger.info(f"   - Call ID: {function_call_id}")
-                        logger.info("=" * 80)
-                        
-                        # Execute the function
-                        function_result = execute_context_function(
-                            function_name, 
-                            function_args, 
-                            direct_context if direct_context else ""
-                        )
-                        
-                        result_preview = function_result[:200] + "..." if len(function_result) > 200 else function_result
-                        logger.info(f"✅ Function result: {result_preview}")
-                        
-                        # Send function result back to OpenAI
-                        function_output = {
-                            "type": "conversation.item.create",
-                            "item": {
-                                "type": "function_call_output",
-                                "call_id": function_call_id,
-                                "output": function_result
-                            }
-                        }
-                        await openai_ws.send(json.dumps(function_output))
-                        
-                        # Trigger response generation
-                        response_create = {
-                            "type": "response.create"
-                        }
-                        await openai_ws.send(json.dumps(response_create))
-                        logger.info(f"✅ Function result sent, response triggered")
+                                # Use LangChain to intelligently answer from direct context
+                                try:
+                                    logger.info(f"🤖 Using LangChain to answer from direct context...")
+                                    langchain_service = get_langchain_service()
+                                    
+                                    # Get intelligent answer from LangChain
+                                    answer = await langchain_service.answer_question(transcript, direct_context)
+                                    
+                                    logger.info(f"✅ LangChain answer: {answer[:200]}...")
+                                    
+                                    # Inject the answer into the conversation
+                                    context_message = {
+                                        "type": "conversation.item.create",
+                                        "item": {
+                                            "type": "message",
+                                            "role": "system",
+                                            "content": [
+                                                {
+                                                    "type": "input_text",
+                                                    "text": f"Based on the data analysis: {answer}"
+                                                }
+                                            ]
+                                        }
+                                    }
+                                    await openai_ws.send(json.dumps(context_message))
+                                    
+                                    # Trigger response
+                                    response_create = {
+                                        "type": "response.create"
+                                    }
+                                    await openai_ws.send(json.dumps(response_create))
+                                    logger.info(f"✅ LangChain answer injected, response triggered")
+                                    
+                                except Exception as e:
+                                    logger.error(f"❌ Error in LangChain processing: {e}")
+                                    logger.error(traceback.format_exc())
                     
                     # Handle response completion
                     elif event_type == 'response.done':

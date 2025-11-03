@@ -28,6 +28,11 @@ openai>=1.12.0
 pinecone>=5.0.0
 websockets>=12.0
 
+# LangChain for advanced context handling
+langchain>=0.1.0
+langchain-openai>=0.0.5
+langchain-community>=0.0.20
+
 # Development dependencies (optional)
 pytest==8.4.2
 pytest-asyncio==1.2.0

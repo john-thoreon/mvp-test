@@ -52,8 +52,9 @@ class TwilioService:
         response.say("Connecting you to an AI assistant. Please wait.", voice='alice')
         
         # Start WebSocket stream
+        # The websocket_url already contains all necessary query parameters
         connect = Connect()
-        stream = Stream(url=f"{websocket_url}?namespace={namespace}")
+        stream = Stream(url=websocket_url)
         connect.append(stream)
         response.append(connect)
         
