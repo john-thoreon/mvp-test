@@ -1025,13 +1025,16 @@ async def initiate_interactive_call(
         if call_request.namespace:
             ws_params.append(f"namespace={call_request.namespace}")
         if call_request.context_text:
-            # Store context_text in a way it can be retrieved (we'll use a simple in-memory store)
+            # Store context_text and initial_message in a way they can be retrieved
             import hashlib
             context_id = hashlib.md5(call_request.context_text.encode()).hexdigest()
             # Store in global dict (you might want to use Redis in production)
             if 'context_store' not in globals():
                 globals()['context_store'] = {}
-            globals()['context_store'][context_id] = call_request.context_text
+            globals()['context_store'][context_id] = {
+                'context': call_request.context_text,
+                'initial_message': call_request.initial_message
+            }
             ws_params.append(f"context_id={context_id}")
         
         websocket_url = f"{ws_url}/ws/twilio-stream?{'&'.join(ws_params)}"
@@ -1230,11 +1233,20 @@ async def twilio_media_stream(websocket: WebSocket):
     logger.info(f"   - Namespace: {namespace or 'None (using direct context)'}")
     logger.info(f"   - Context ID: {context_id or 'None'}")
     
-    # Retrieve context_text if context_id is provided
+    # Retrieve context_text and initial_message if context_id is provided
     direct_context = None
+    initial_greeting = None
     if context_id and 'context_store' in globals():
-        direct_context = globals()['context_store'].get(context_id)
+        stored_data = globals()['context_store'].get(context_id)
+        if stored_data:
+            if isinstance(stored_data, dict):
+                direct_context = stored_data.get('context')
+                initial_greeting = stored_data.get('initial_message')
+            else:
+                # Fallback for old format (just string)
+                direct_context = stored_data
         logger.info(f"   - Direct context loaded: {len(direct_context) if direct_context else 0} characters")
+        logger.info(f"   - Initial greeting: {initial_greeting if initial_greeting else 'None (will use default)'}")
     
     # Connection state
     openai_ws = None
@@ -1249,26 +1261,38 @@ async def twilio_media_stream(websocket: WebSocket):
         
         # Build instructions based on mode
         if direct_context:
-            instructions = f"""You are a helpful health-focused AI assistant. 
+            # Build greeting instruction
+            greeting_instruction = ""
+            if initial_greeting:
+                greeting_instruction = f"""
+INITIAL GREETING:
+When the conversation starts, begin by saying: "{initial_greeting}"
+This should be your FIRST message to introduce the conversation.
+"""
+            
+            instructions = f"""You are a helpful AI assistant designed to answer questions based on the provided context.
 
-IMPORTANT RESTRICTIONS:
-1. ONLY answer questions related to health, medical, wellness, healthcare, clinical, or medical topics.
-2. If a question is NOT related to health/medical topics, politely decline and say: "I can only answer health-related questions. Please ask me about health, medical, or wellness topics."
-3. Use the following context to answer questions accurately:
-
+IMPORTANT INSTRUCTIONS:
+1. Your PRIMARY TASK is to answer questions using ONLY the information provided in the context below.
+2. Be accurate, clear, and concise in your responses.
+3. If a question cannot be answered using the provided context, say: "I don't have that specific information in the context provided."
+4. Do not make up information or provide answers that are not supported by the context.
+5. You can have a natural conversation, but always base your answers on the context.
+{greeting_instruction}
 CONTEXT:
 {direct_context}
 
-If the answer is not in the provided context, say "I don't have that specific information in my current context."
+Remember: Always answer based on the context above. If the information is not in the context, be honest about it.
 """
         else:
-            instructions = """You are a helpful health-focused AI assistant with access to a medical knowledge base.
+            instructions = """You are a helpful AI assistant with access to a knowledge base.
 
-IMPORTANT RESTRICTIONS:
-1. ONLY answer questions related to health, medical, wellness, healthcare, clinical, or medical topics.
-2. If a question is NOT related to health/medical topics, politely decline and say: "I can only answer health-related questions. Please ask me about health, medical, or wellness topics."
-3. Use the provided context from the knowledge base to answer questions accurately.
-4. If you don't find relevant information in the context, say so honestly.
+IMPORTANT INSTRUCTIONS:
+1. Answer questions using the context that will be provided from the knowledge base.
+2. Be accurate, clear, and concise in your responses.
+3. If the provided context doesn't contain the answer, say so honestly.
+4. Do not make up information or provide answers that are not supported by the provided context.
+5. You can have a natural conversation while staying within the bounds of the provided information.
 """
         
         # Configure and connect to OpenAI Real-time API using service
@@ -1318,6 +1342,20 @@ IMPORTANT RESTRICTIONS:
                         logger.info(f"   - CallSID: {call_sid}")
                         logger.info(f"   - Message count: {message_count}")
                         logger.info("=" * 80)
+                        
+                        # Trigger initial greeting if provided
+                        if initial_greeting:
+                            logger.info(f"📢 Triggering initial greeting: {initial_greeting}")
+                            # Send a response.create event to trigger the AI to speak
+                            greeting_trigger = {
+                                "type": "response.create",
+                                "response": {
+                                    "modalities": ["audio", "text"],
+                                    "instructions": f"Say this greeting to start the conversation: {initial_greeting}"
+                                }
+                            }
+                            await openai_ws.send(json.dumps(greeting_trigger))
+                            logger.info("✅ Initial greeting triggered")
                         
                     elif event_type == 'media':
                         # Forward audio to OpenAI using service
