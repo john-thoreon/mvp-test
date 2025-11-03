@@ -11,6 +11,7 @@ import logging
 import threading
 import base64
 import asyncio
+import traceback
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
@@ -634,6 +635,168 @@ async def query_pinecone_context(query_text: str, namespace: str, top_k: int = 5
     except Exception as e:
         logger.error(f"Error in query_pinecone_context: {e}")
         return f"Error retrieving context: {str(e)}"
+
+# Helper function for context-based function calling
+def execute_context_function(function_name: str, arguments: dict, context: str) -> str:
+    """
+    Execute a function call with the provided context.
+    This extracts structured information from the context based on the function.
+    
+    Args:
+        function_name: Name of the function to execute
+        arguments: Function arguments
+        context: The context data to search/analyze
+        
+    Returns:
+        Function result as a string
+    """
+    try:
+        if function_name == "get_summary":
+            aspect = arguments.get("aspect", "overall")
+            
+            # Extract summary based on aspect
+            if aspect == "overall":
+                # Look for summary section
+                if "=== SUMMARY ===" in context:
+                    summary_start = context.find("=== SUMMARY ===")
+                    # Find the next section marker or take next 500 chars
+                    next_section = context.find("\n===", summary_start + 15)
+                    if next_section > summary_start:
+                        return context[summary_start:next_section].strip()
+                    else:
+                        return context[summary_start:summary_start + 500].strip()
+                return "I don't see a summary section in the data provided. Can you ask me about specific aspects?"
+            
+            elif aspect == "by_site":
+                if "=== DEVIATIONS BY SITE ===" in context:
+                    site_start = context.find("=== DEVIATIONS BY SITE ===")
+                    next_section = context.find("\n===", site_start + 26)
+                    if next_section > site_start:
+                        return context[site_start:next_section].strip()
+                    else:
+                        return context[site_start:site_start + 1000].strip()
+                return "I don't see site-based breakdown in the data."
+            
+            elif aspect == "by_type":
+                if "=== DEVIATIONS BY TYPE ===" in context:
+                    type_start = context.find("=== DEVIATIONS BY TYPE ===")
+                    next_section = context.find("=== DEVIATIONS BY SITE ===", type_start)
+                    if next_section > type_start:
+                        return context[type_start:next_section].strip()
+                    else:
+                        return context[type_start:type_start + 2000].strip()
+                return "I don't see type-based breakdown in the data."
+            
+            elif aspect == "by_subject":
+                if "=== AFFECTED SUBJECTS ===" in context:
+                    subject_start = context.find("=== AFFECTED SUBJECTS ===")
+                    next_section = context.find("\n===", subject_start + 25)
+                    if next_section > subject_start:
+                        return context[subject_start:next_section].strip()
+                    else:
+                        return context[subject_start:subject_start + 800].strip()
+                return "I don't see subject breakdown in the data."
+            
+            return f"I can't provide a summary for '{aspect}'. Try asking for 'overall', 'by_site', 'by_type', or 'by_subject'."
+        
+        elif function_name == "search_context":
+            query = arguments.get("query", "").lower()
+            search_type = arguments.get("search_type", "general")
+            
+            if not query:
+                return "Please specify what you'd like to search for."
+            
+            # Split context into sections
+            sections = context.split("===")
+            relevant_sections = []
+            
+            for i, section in enumerate(sections):
+                section_lower = section.lower()
+                
+                # Check if query appears in this section
+                if query in section_lower:
+                    # Include section title if available
+                    if i > 0:
+                        title = sections[i-1].strip().split('\n')[-1] if sections[i-1].strip() else ""
+                        relevant_sections.append(f"=== {title} ===\n{section.strip()}")
+                    else:
+                        relevant_sections.append(section.strip())
+            
+            if relevant_sections:
+                # Limit to first 2 most relevant sections
+                result = "\n\n".join(relevant_sections[:2])
+                # Limit total length
+                if len(result) > 1500:
+                    result = result[:1500] + "\n... (truncated for brevity)"
+                return result
+            
+            return f"I couldn't find specific information about '{query}' in the data. Could you try rephrasing or asking about something else?"
+        
+        elif function_name == "get_specific_deviation":
+            subject_id = arguments.get("subject_id", "").upper()
+            site_id = arguments.get("site_id", "")
+            deviation_type = arguments.get("deviation_type", "")
+            
+            search_term = subject_id or site_id or deviation_type
+            if not search_term:
+                return "Please specify a subject ID, site ID, or deviation type."
+            
+            # Search for the specific information
+            lines = context.split('\n')
+            relevant_lines = []
+            context_window = 5  # lines before and after
+            
+            for i, line in enumerate(lines):
+                if search_term.lower() in line.lower():
+                    # Add surrounding context
+                    start = max(0, i - context_window)
+                    end = min(len(lines), i + context_window + 1)
+                    relevant_lines.append("\n".join(lines[start:end]))
+                    relevant_lines.append("---")
+            
+            if relevant_lines:
+                result = "\n".join(relevant_lines[:500])  # Limit response size
+                if len(result) > 1500:
+                    result = result[:1500] + "\n... (showing first few matches)"
+                return result
+            
+            return f"I couldn't find information about '{search_term}' in the data."
+        
+        elif function_name == "count_and_filter":
+            filter_type = arguments.get("filter_type")
+            filter_value = arguments.get("filter_value", "")
+            
+            if not filter_type:
+                return "Please specify what you'd like to count or filter."
+            
+            # Count occurrences
+            lines = context.split('\n')
+            matching_lines = []
+            count = 0
+            
+            search_term = filter_value.lower() if filter_value else filter_type.lower()
+            
+            for line in lines:
+                if search_term in line.lower():
+                    count += 1
+                    matching_lines.append(line.strip())
+            
+            if count > 0:
+                result = f"Found {count} instance(s) related to '{search_term}':\n\n"
+                # Show first 10 matches
+                result += "\n".join(matching_lines[:10])
+                if len(matching_lines) > 10:
+                    result += f"\n... and {len(matching_lines) - 10} more"
+                return result
+            
+            return f"No instances found for '{search_term}'."
+        
+        return f"Unknown function: {function_name}"
+    
+    except Exception as e:
+        logger.error(f"Error executing function {function_name}: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return f"I encountered an error while processing that request: {str(e)}"
 
 # API Routes
 @app.get("/")
@@ -1297,6 +1460,91 @@ IMPORTANT INSTRUCTIONS:
         
         # Configure and connect to OpenAI Real-time API using service
         # Note: Twilio uses g711_ulaw format which is native for phone calls
+        
+        # Define function tools for context analysis (only if direct_context is provided)
+        tools = []
+        if direct_context:
+            tools = [
+                {
+                    "type": "function",
+                    "name": "get_summary",
+                    "description": "Get a summary from the provided context data. Use this when the user asks for a summary, overview, totals, or general information about the data.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "aspect": {
+                                "type": "string",
+                                "description": "The specific aspect to summarize",
+                                "enum": ["overall", "by_site", "by_type", "by_subject"]
+                            }
+                        },
+                        "required": ["aspect"]
+                    }
+                },
+                {
+                    "type": "function",
+                    "name": "search_context",
+                    "description": "Search for specific information in the context. Use this when the user asks about specific subjects, sites, types, or other specific data points.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The search term or subject ID to find in the context (e.g., 'subject 1101-0002', 'site 2102', 'visit window')"
+                            },
+                            "search_type": {
+                                "type": "string",
+                                "description": "The type of search",
+                                "enum": ["subject", "site", "type", "general"]
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                },
+                {
+                    "type": "function",
+                    "name": "get_specific_deviation",
+                    "description": "Get detailed information about specific deviations. Use when user asks about a particular subject, site, or deviation type.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "subject_id": {
+                                "type": "string",
+                                "description": "The subject ID to look up (e.g., '1101-0002')"
+                            },
+                            "site_id": {
+                                "type": "string",
+                                "description": "The site ID to look up (e.g., '1101', '2102')"
+                            },
+                            "deviation_type": {
+                                "type": "string",
+                                "description": "The type of deviation (e.g., 'visit window', 'missing assessment', 'incorrect dosing')"
+                            }
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "name": "count_and_filter",
+                    "description": "Count or filter data by specific criteria. Use when user asks 'how many', 'count', 'list all', or wants filtered data.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filter_type": {
+                                "type": "string",
+                                "description": "What to count or filter",
+                                "enum": ["subjects", "sites", "deviations", "major", "minor", "critical"]
+                            },
+                            "filter_value": {
+                                "type": "string",
+                                "description": "Optional specific value to filter by"
+                            }
+                        },
+                        "required": ["filter_type"]
+                    }
+                }
+            ]
+        
         session_config = {
             "type": "session.update",
             "session": {
@@ -1318,6 +1566,12 @@ IMPORTANT INSTRUCTIONS:
                 "max_response_output_tokens": 4096
             }
         }
+        
+        # Add tools if we have direct context
+        if tools:
+            session_config["session"]["tools"] = tools
+            session_config["session"]["tool_choice"] = "auto"
+            logger.info(f"   - Function tools enabled: {len(tools)} tools")
         
         openai_ws = await openai_service.connect_realtime_api(session_config)
         logger.info("✅ OpenAI Realtime API session configured successfully")
@@ -1467,6 +1721,52 @@ IMPORTANT INSTRUCTIONS:
                             elif direct_context:
                                 # Using direct context - it's already in the system instructions
                                 logger.info(f"ℹ️ Using direct context (already in system instructions)")
+                    
+                    # Handle function calls
+                    elif event_type == 'response.function_call_arguments.done':
+                        function_call_id = data.get('call_id')
+                        function_name = data.get('name')
+                        function_args_str = data.get('arguments', '{}')
+                        
+                        try:
+                            function_args = json.loads(function_args_str)
+                        except json.JSONDecodeError:
+                            function_args = {}
+                        
+                        logger.info("=" * 80)
+                        logger.info(f"🔧 FUNCTION CALL")
+                        logger.info(f"   - Function: {function_name}")
+                        logger.info(f"   - Arguments: {function_args}")
+                        logger.info(f"   - Call ID: {function_call_id}")
+                        logger.info("=" * 80)
+                        
+                        # Execute the function
+                        function_result = execute_context_function(
+                            function_name, 
+                            function_args, 
+                            direct_context if direct_context else ""
+                        )
+                        
+                        result_preview = function_result[:200] + "..." if len(function_result) > 200 else function_result
+                        logger.info(f"✅ Function result: {result_preview}")
+                        
+                        # Send function result back to OpenAI
+                        function_output = {
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "function_call_output",
+                                "call_id": function_call_id,
+                                "output": function_result
+                            }
+                        }
+                        await openai_ws.send(json.dumps(function_output))
+                        
+                        # Trigger response generation
+                        response_create = {
+                            "type": "response.create"
+                        }
+                        await openai_ws.send(json.dumps(response_create))
+                        logger.info(f"✅ Function result sent, response triggered")
                     
                     # Handle response completion
                     elif event_type == 'response.done':
