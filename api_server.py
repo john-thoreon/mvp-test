@@ -1195,25 +1195,29 @@ async def twilio_media_stream(websocket: WebSocket):
     """
     await websocket.accept()
     
-    logger.info("Twilio WebSocket connection accepted")
+    logger.info("=" * 80)
+    logger.info("🔵 TWILIO WEBSOCKET CONNECTION ACCEPTED")
+    logger.info("=" * 80)
     
     # Extract parameters from query parameters
     namespace = websocket.query_params.get('namespace')
     context_id = websocket.query_params.get('context_id')
     
+    logger.info(f"📋 Configuration:")
+    logger.info(f"   - Namespace: {namespace or 'None (using direct context)'}")
+    logger.info(f"   - Context ID: {context_id or 'None'}")
+    
     # Retrieve context_text if context_id is provided
     direct_context = None
     if context_id and 'context_store' in globals():
         direct_context = globals()['context_store'].get(context_id)
-        logger.info(f"Using direct context (length: {len(direct_context) if direct_context else 0})")
-    
-    if namespace:
-        logger.info(f"Using Pinecone namespace: {namespace}")
+        logger.info(f"   - Direct context loaded: {len(direct_context) if direct_context else 0} characters")
     
     # Connection state
     openai_ws = None
     stream_sid = None
     call_sid = None
+    connection_start_time = datetime.now()
     
     try:
         # Get services
@@ -1269,41 +1273,82 @@ IMPORTANT RESTRICTIONS:
         }
         
         openai_ws = await openai_service.connect_realtime_api(session_config)
-        logger.info("OpenAI session configured")
+        logger.info("✅ OpenAI Realtime API session configured successfully")
         
         # Task for receiving from Twilio and sending to OpenAI
         async def twilio_to_openai():
             nonlocal stream_sid, call_sid
+            message_count = 0
             try:
+                logger.info("🔄 Starting twilio_to_openai task...")
                 async for message in websocket.iter_text():
+                    message_count += 1
                     data = json.loads(message)
                     event_type = data.get('event')
                     
                     if event_type == 'start':
                         stream_sid = data['start']['streamSid']
                         call_sid = data['start']['callSid']
-                        logger.info(f"Stream started - StreamSID: {stream_sid}, CallSID: {call_sid}")
+                        logger.info("=" * 80)
+                        logger.info(f"🟢 STREAM STARTED")
+                        logger.info(f"   - StreamSID: {stream_sid}")
+                        logger.info(f"   - CallSID: {call_sid}")
+                        logger.info(f"   - Message count: {message_count}")
+                        logger.info("=" * 80)
                         
                     elif event_type == 'media':
                         # Forward audio to OpenAI using service
                         media_payload = data['media']['payload']
                         await openai_service.send_audio_to_realtime(openai_ws, media_payload)
+                        if message_count % 100 == 0:  # Log every 100 media messages
+                            logger.info(f"📡 Audio streaming active - {message_count} messages processed")
                         
                     elif event_type == 'stop':
-                        logger.info(f"Stream stopped - StreamSID: {stream_sid}")
+                        duration = (datetime.now() - connection_start_time).total_seconds()
+                        logger.info("=" * 80)
+                        logger.info(f"🔴 STREAM STOPPED (Twilio sent stop event)")
+                        logger.info(f"   - StreamSID: {stream_sid}")
+                        logger.info(f"   - CallSID: {call_sid}")
+                        logger.info(f"   - Duration: {duration:.2f} seconds")
+                        logger.info(f"   - Total messages: {message_count}")
+                        logger.info(f"   - Reason: Twilio sent 'stop' event (call ended by user or system)")
+                        logger.info("=" * 80)
                         break
                         
-            except WebSocketDisconnect:
-                logger.info("Twilio WebSocket disconnected")
+            except WebSocketDisconnect as e:
+                duration = (datetime.now() - connection_start_time).total_seconds()
+                logger.warning("=" * 80)
+                logger.warning(f"⚠️ TWILIO WEBSOCKET DISCONNECTED")
+                logger.warning(f"   - StreamSID: {stream_sid}")
+                logger.warning(f"   - CallSID: {call_sid}")
+                logger.warning(f"   - Duration: {duration:.2f} seconds")
+                logger.warning(f"   - Messages processed: {message_count}")
+                logger.warning(f"   - Reason: {str(e)}")
+                logger.warning("=" * 80)
             except Exception as e:
-                logger.error(f"Error in twilio_to_openai: {e}")
+                duration = (datetime.now() - connection_start_time).total_seconds()
+                logger.error("=" * 80)
+                logger.error(f"❌ ERROR in twilio_to_openai")
+                logger.error(f"   - StreamSID: {stream_sid}")
+                logger.error(f"   - CallSID: {call_sid}")
+                logger.error(f"   - Duration: {duration:.2f} seconds")
+                logger.error(f"   - Messages processed: {message_count}")
+                logger.error(f"   - Error: {str(e)}")
+                logger.error("=" * 80)
+                import traceback
+                logger.error(traceback.format_exc())
         
         # Task for receiving from OpenAI and sending to Twilio
         async def openai_to_twilio():
+            openai_message_count = 0
+            transcript_count = 0
+            audio_chunk_count = 0
             try:
+                logger.info("🔄 Starting openai_to_twilio task...")
                 last_transcript = ""
                 
                 async for message in openai_ws:
+                    openai_message_count += 1
                     data = json.loads(message)
                     event_type = data.get('type')
                     
@@ -1311,6 +1356,7 @@ IMPORTANT RESTRICTIONS:
                     if event_type == 'response.audio.delta':
                         audio_delta = data.get('delta')
                         if audio_delta:
+                            audio_chunk_count += 1
                             # Send audio to Twilio
                             media_message = {
                                 "event": "media",
@@ -1320,67 +1366,119 @@ IMPORTANT RESTRICTIONS:
                                 }
                             }
                             await websocket.send_json(media_message)
+                            if audio_chunk_count % 50 == 0:  # Log every 50 audio chunks
+                                logger.info(f"🔊 AI speaking - {audio_chunk_count} audio chunks sent")
                     
                     # Handle transcripts for RAG queries
                     elif event_type == 'conversation.item.input_audio_transcription.completed':
                         transcript = data.get('transcript', '')
                         if transcript and transcript != last_transcript:
                             last_transcript = transcript
-                            logger.info(f"User said: {transcript}")
+                            transcript_count += 1
+                            logger.info("=" * 80)
+                            logger.info(f"🗣️ USER SPEECH TRANSCRIBED (#{transcript_count})")
+                            logger.info(f"   - Transcript: \"{transcript}\"")
+                            logger.info(f"   - Length: {len(transcript)} characters")
+                            logger.info("=" * 80)
                             
                             # Only query Pinecone if namespace is provided (not using direct context)
                             if namespace and rag_service:
                                 try:
+                                    logger.info(f"🔍 Querying Pinecone namespace '{namespace}'...")
                                     context = await rag_service.query_context(
                                         query_text=transcript,
                                         namespace=namespace,
                                         top_k=5
                                     )
-                                    logger.info(f"Retrieved context from Pinecone (length: {len(context)})")
+                                    logger.info(f"✅ Retrieved context from Pinecone (length: {len(context)} characters)")
                                     
                                     # Inject context into conversation using service
                                     if context and "No relevant context" not in context:
                                         await openai_service.inject_context_to_conversation(openai_ws, context)
+                                        logger.info(f"✅ Context injected into conversation")
+                                    else:
+                                        logger.warning(f"⚠️ No relevant context found in Pinecone")
                                         
                                 except Exception as e:
-                                    logger.error(f"Error querying Pinecone: {e}")
+                                    logger.error(f"❌ Error querying Pinecone: {e}")
+                                    import traceback
+                                    logger.error(traceback.format_exc())
                             elif direct_context:
                                 # Using direct context - it's already in the system instructions
-                                logger.info(f"Using direct context (already provided in instructions)")
+                                logger.info(f"ℹ️ Using direct context (already in system instructions)")
                     
                     # Handle response completion
                     elif event_type == 'response.done':
-                        logger.info("Response completed")
+                        logger.info(f"✅ AI response completed (Total OpenAI messages: {openai_message_count})")
                     
                     # Handle errors
                     elif event_type == 'error':
                         error_info = data.get('error', {})
-                        logger.error(f"OpenAI error: {error_info}")
+                        logger.error("=" * 80)
+                        logger.error(f"❌ OPENAI ERROR")
+                        logger.error(f"   - Error: {error_info}")
+                        logger.error(f"   - Message count: {openai_message_count}")
+                        logger.error("=" * 80)
                         
             except Exception as e:
-                logger.error(f"Error in openai_to_twilio: {e}")
+                duration = (datetime.now() - connection_start_time).total_seconds()
+                logger.error("=" * 80)
+                logger.error(f"❌ ERROR in openai_to_twilio")
+                logger.error(f"   - Duration: {duration:.2f} seconds")
+                logger.error(f"   - OpenAI messages: {openai_message_count}")
+                logger.error(f"   - Transcripts: {transcript_count}")
+                logger.error(f"   - Audio chunks: {audio_chunk_count}")
+                logger.error(f"   - Error: {str(e)}")
+                logger.error("=" * 80)
+                import traceback
+                logger.error(traceback.format_exc())
         
         # Run both tasks concurrently
+        logger.info("🚀 Starting concurrent tasks (twilio_to_openai & openai_to_twilio)...")
         await asyncio.gather(
             twilio_to_openai(),
             openai_to_twilio()
         )
+        logger.info("✅ Both tasks completed")
         
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        duration = (datetime.now() - connection_start_time).total_seconds()
+        logger.error("=" * 80)
+        logger.error(f"❌ WEBSOCKET ERROR")
+        logger.error(f"   - CallSID: {call_sid}")
+        logger.error(f"   - Duration: {duration:.2f} seconds")
+        logger.error(f"   - Error: {str(e)}")
+        logger.error("=" * 80)
+        import traceback
+        logger.error(traceback.format_exc())
     finally:
         # Clean up
+        duration = (datetime.now() - connection_start_time).total_seconds()
+        logger.info("=" * 80)
+        logger.info(f"🔵 WEBSOCKET SESSION CLEANUP")
+        logger.info(f"   - CallSID: {call_sid}")
+        logger.info(f"   - StreamSID: {stream_sid}")
+        logger.info(f"   - Total duration: {duration:.2f} seconds")
+        logger.info("=" * 80)
+        
         if openai_ws:
-            await openai_ws.close()
-            logger.info("OpenAI WebSocket closed")
+            try:
+                await openai_ws.close()
+                logger.info("✅ OpenAI WebSocket closed")
+            except Exception as e:
+                logger.warning(f"⚠️ Error closing OpenAI WebSocket: {e}")
         
         try:
             await websocket.close()
-            logger.info("Twilio WebSocket closed")
-        except:
-            pass
+            logger.info("✅ Twilio WebSocket closed")
+        except Exception as e:
+            logger.warning(f"⚠️ Error closing Twilio WebSocket: {e}")
         
-        logger.info(f"WebSocket session ended - CallSID: {call_sid}")
+        logger.info("=" * 80)
+        logger.info(f"🔵 WEBSOCKET SESSION ENDED")
+        logger.info(f"   - CallSID: {call_sid}")
+        logger.info(f"   - Total duration: {duration:.2f} seconds")
+        logger.info("=" * 80)
 
 @app.websocket("/ws/test-conversation")
 async def test_conversation(websocket: WebSocket):
