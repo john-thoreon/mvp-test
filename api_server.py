@@ -1125,10 +1125,12 @@ async def get_call_status_endpoint(call_sid: str):
         logger.error(f"Error fetching call status: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch call status: {str(e)}")
 
+@app.get("/webhooks/twilio/call-status")
 @app.post("/webhooks/twilio/call-status")
 async def twilio_call_status_callback(request: Request):
     """
     Webhook to receive call status updates from Twilio
+    Accepts both GET and POST requests as Twilio sends both.
     
     Args:
         request: Request containing Twilio callback data
@@ -1137,14 +1139,24 @@ async def twilio_call_status_callback(request: Request):
         Success acknowledgment
     """
     try:
-        form_data = await request.form()
-        call_sid = form_data.get('CallSid')
-        call_status = form_data.get('CallStatus')
-        from_number = form_data.get('From')
-        to_number = form_data.get('To')
-        duration = form_data.get('CallDuration')
+        # Twilio sends GET requests by default, but can also send POST
+        if request.method == "GET":
+            # Extract from query parameters
+            call_sid = request.query_params.get('CallSid')
+            call_status = request.query_params.get('CallStatus')
+            from_number = request.query_params.get('From')
+            to_number = request.query_params.get('To')
+            duration = request.query_params.get('CallDuration')
+        else:
+            # Extract from form data (POST)
+            form_data = await request.form()
+            call_sid = form_data.get('CallSid')
+            call_status = form_data.get('CallStatus')
+            from_number = form_data.get('From')
+            to_number = form_data.get('To')
+            duration = form_data.get('CallDuration')
         
-        logger.info(f"\n=== TWILIO CALL STATUS UPDATE ===")
+        logger.info(f"\n=== TWILIO CALL STATUS UPDATE ({request.method}) ===")
         logger.info(f"Call SID: {call_sid}")
         logger.info(f"Status: {call_status}")
         logger.info(f"From: {from_number}")
