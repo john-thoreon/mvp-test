@@ -37,7 +37,7 @@ class TwilioService:
             logger.info("Twilio client created")
         return self._client
     
-    def generate_interactive_twiml(self, websocket_url: str, namespace: str) -> str:
+    def generate_interactive_twiml(self, websocket_url: str, namespace: str, voice: str = "alloy") -> str:
         """
         Generate TwiML for interactive AI call with WebSocket streaming.
         

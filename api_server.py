@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Depends, Form, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import os
@@ -40,6 +41,11 @@ app = FastAPI(
     description="REST API for uploading PDFs and triggering Unstructured workflows",
     version="1.0.0"
 )
+
+# Mount static files directory for test page
+static_dir = Path(__file__).parent / "static"
+static_dir.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 # GCP Pub/Sub configuration
 PUBSUB_PROJECT_ID = os.getenv("PUBSUB_PROJECT_ID")
@@ -98,7 +104,8 @@ class ApiError(BaseModel):
 
 class CallRequest(BaseModel):
     phone_number: str
-    namespace: str
+    namespace: Optional[str] = None
+    context_text: Optional[str] = None
     initial_message: Optional[str] = "Hello, how can I help you today?"
 
 class AlertCallRequest(BaseModel):
@@ -631,6 +638,18 @@ async def root():
     """Health check endpoint"""
     return {"message": "PDF Upload & Workflow API", "status": "active"}
 
+@app.get("/test", response_class=HTMLResponse)
+async def test_page():
+    """Serve the test conversation page"""
+    html_file = Path(__file__).parent / "static" / "test_conversation.html"
+    if html_file.exists():
+        return HTMLResponse(content=html_file.read_text(), status_code=200)
+    else:
+        return HTMLResponse(
+            content="<h1>Test page not found</h1><p>Please ensure static/test_conversation.html exists.</p>",
+            status_code=404
+        )
+
 @app.get("/workflows", response_model=List[WorkflowInfo])
 async def list_workflows():
     """List all available workflows"""
@@ -957,7 +976,15 @@ async def initiate_interactive_call(
         logger.info(f"\n=== INTERACTIVE CALL REQUEST ===")
         logger.info(f"Phone Number: {call_request.phone_number}")
         logger.info(f"Namespace: {call_request.namespace}")
+        logger.info(f"Context Text Length: {len(call_request.context_text) if call_request.context_text else 0}")
         logger.info(f"Initial Message: {call_request.initial_message}")
+        
+        # Validate that either namespace or context_text is provided
+        if not call_request.namespace and not call_request.context_text:
+            raise HTTPException(
+                status_code=400,
+                detail="Either 'namespace' or 'context_text' must be provided"
+            )
         
         # Validate phone number format
         phone = call_request.phone_number.strip()
@@ -969,12 +996,30 @@ async def initiate_interactive_call(
         # Build WebSocket URL (use request base URL for production)
         base_url = str(request.base_url).rstrip('/')
         ws_url = base_url.replace('http://', 'ws://').replace('https://', 'wss://')
-        websocket_url = f"{ws_url}/ws/twilio-stream"
+        
+        # Add parameters to WebSocket URL
+        ws_params = []
+        if call_request.namespace:
+            ws_params.append(f"namespace={call_request.namespace}")
+        if call_request.context_text:
+            # Store context_text in a way it can be retrieved (we'll use a simple in-memory store)
+            import hashlib
+            context_id = hashlib.md5(call_request.context_text.encode()).hexdigest()
+            # Store in global dict (you might want to use Redis in production)
+            if 'context_store' not in globals():
+                globals()['context_store'] = {}
+            globals()['context_store'][context_id] = call_request.context_text
+            ws_params.append(f"context_id={context_id}")
+        
+        websocket_url = f"{ws_url}/ws/twilio-stream?{'&'.join(ws_params)}"
         
         logger.info(f"WebSocket URL: {websocket_url}")
         
         # Generate TwiML using service
-        twiml = twilio_service.generate_interactive_twiml(websocket_url, call_request.namespace)
+        twiml = twilio_service.generate_interactive_twiml(
+            websocket_url, 
+            call_request.namespace or "direct-context"
+        )
         
         # Initiate call using service
         call_result = twilio_service.initiate_call(
@@ -1140,9 +1185,18 @@ async def twilio_media_stream(websocket: WebSocket):
     
     logger.info("Twilio WebSocket connection accepted")
     
-    # Extract namespace from query parameters
-    namespace = websocket.query_params.get('namespace', 'default')
-    logger.info(f"Using Pinecone namespace: {namespace}")
+    # Extract parameters from query parameters
+    namespace = websocket.query_params.get('namespace')
+    context_id = websocket.query_params.get('context_id')
+    
+    # Retrieve context_text if context_id is provided
+    direct_context = None
+    if context_id and 'context_store' in globals():
+        direct_context = globals()['context_store'].get(context_id)
+        logger.info(f"Using direct context (length: {len(direct_context) if direct_context else 0})")
+    
+    if namespace:
+        logger.info(f"Using Pinecone namespace: {namespace}")
     
     # Connection state
     openai_ws = None
@@ -1152,14 +1206,55 @@ async def twilio_media_stream(websocket: WebSocket):
     try:
         # Get services
         openai_service = get_openai_service()
-        rag_service = get_rag_service()
+        rag_service = get_rag_service() if namespace else None
+        
+        # Build instructions based on mode
+        if direct_context:
+            instructions = f"""You are a helpful health-focused AI assistant. 
+
+IMPORTANT RESTRICTIONS:
+1. ONLY answer questions related to health, medical, wellness, healthcare, clinical, or medical topics.
+2. If a question is NOT related to health/medical topics, politely decline and say: "I can only answer health-related questions. Please ask me about health, medical, or wellness topics."
+3. Use the following context to answer questions accurately:
+
+CONTEXT:
+{direct_context}
+
+If the answer is not in the provided context, say "I don't have that specific information in my current context."
+"""
+        else:
+            instructions = """You are a helpful health-focused AI assistant with access to a medical knowledge base.
+
+IMPORTANT RESTRICTIONS:
+1. ONLY answer questions related to health, medical, wellness, healthcare, clinical, or medical topics.
+2. If a question is NOT related to health/medical topics, politely decline and say: "I can only answer health-related questions. Please ask me about health, medical, or wellness topics."
+3. Use the provided context from the knowledge base to answer questions accurately.
+4. If you don't find relevant information in the context, say so honestly.
+"""
         
         # Configure and connect to OpenAI Real-time API using service
-        session_config = openai_service.get_default_session_config(
-            instructions="You are a helpful AI assistant. Use the provided context from the knowledge base to answer questions accurately. If you don't find relevant information in the context, say so honestly.",
-            voice="alloy",
-            temperature=0.7
-        )
+        # Note: Twilio uses g711_ulaw format which is native for phone calls
+        session_config = {
+            "type": "session.update",
+            "session": {
+                "modalities": ["text", "audio"],
+                "instructions": instructions,
+                "voice": "alloy",
+                "input_audio_format": "g711_ulaw",  # Twilio's native format
+                "output_audio_format": "g711_ulaw", # Twilio's native format
+                "input_audio_transcription": {
+                    "model": "whisper-1"
+                },
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.5,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 500
+                },
+                "temperature": 0.7,
+                "max_response_output_tokens": 4096
+            }
+        }
         
         openai_ws = await openai_service.connect_realtime_api(session_config)
         logger.info("OpenAI session configured")
@@ -1221,21 +1316,25 @@ async def twilio_media_stream(websocket: WebSocket):
                             last_transcript = transcript
                             logger.info(f"User said: {transcript}")
                             
-                            # Query Pinecone for context using RAG service
-                            try:
-                                context = await rag_service.query_context(
-                                    query_text=transcript,
-                                    namespace=namespace,
-                                    top_k=5
-                                )
-                                logger.info(f"Retrieved context from Pinecone (length: {len(context)})")
-                                
-                                # Inject context into conversation using service
-                                if context and "No relevant context" not in context:
-                                    await openai_service.inject_context_to_conversation(openai_ws, context)
+                            # Only query Pinecone if namespace is provided (not using direct context)
+                            if namespace and rag_service:
+                                try:
+                                    context = await rag_service.query_context(
+                                        query_text=transcript,
+                                        namespace=namespace,
+                                        top_k=5
+                                    )
+                                    logger.info(f"Retrieved context from Pinecone (length: {len(context)})")
                                     
-                            except Exception as e:
-                                logger.error(f"Error querying Pinecone: {e}")
+                                    # Inject context into conversation using service
+                                    if context and "No relevant context" not in context:
+                                        await openai_service.inject_context_to_conversation(openai_ws, context)
+                                        
+                                except Exception as e:
+                                    logger.error(f"Error querying Pinecone: {e}")
+                            elif direct_context:
+                                # Using direct context - it's already in the system instructions
+                                logger.info(f"Using direct context (already provided in instructions)")
                     
                     # Handle response completion
                     elif event_type == 'response.done':
@@ -1270,6 +1369,205 @@ async def twilio_media_stream(websocket: WebSocket):
             pass
         
         logger.info(f"WebSocket session ended - CallSID: {call_sid}")
+
+@app.websocket("/ws/test-conversation")
+async def test_conversation(websocket: WebSocket):
+    """
+    WebSocket endpoint for testing conversational AI without making actual phone calls.
+    This simulates the same flow as Twilio but uses browser audio instead.
+    """
+    await websocket.accept()
+    
+    logger.info("Test conversation WebSocket connection accepted")
+    
+    # Extract parameters from query
+    namespace = websocket.query_params.get('namespace', 'test')
+    voice = websocket.query_params.get('voice', 'alloy')
+    logger.info(f"Test conversation - Namespace: {namespace}, Voice: {voice}")
+    
+    # Connection state
+    openai_ws = None
+    
+    try:
+        # Get services
+        openai_service = get_openai_service()
+        rag_service = get_rag_service()
+        
+        # Send initial status
+        await websocket.send_json({
+            'type': 'status',
+            'message': f'Connecting to OpenAI Realtime API with voice: {voice}'
+        })
+        
+        # Configure and connect to OpenAI Real-time API
+        session_config = openai_service.get_default_session_config(
+            instructions=f"You are a helpful AI assistant. Use the provided context from the knowledge base (namespace: {namespace}) to answer questions accurately. If you don't find relevant information in the context, say so honestly.",
+            voice=voice,
+            temperature=0.7
+        )
+        
+        openai_ws = await openai_service.connect_realtime_api(session_config)
+        logger.info("Test conversation: OpenAI session configured")
+        
+        await websocket.send_json({
+            'type': 'status',
+            'message': '✓ Connected to OpenAI Realtime API'
+        })
+        
+        # Task for receiving from browser and sending to OpenAI
+        async def browser_to_openai():
+            try:
+                logger.info("Test conversation: browser_to_openai task started")
+                async for message in websocket.iter_text():
+                    data = json.loads(message)
+                    message_type = data.get('type')
+                    
+                    if message_type == 'audio':
+                        # Forward audio to OpenAI
+                        audio_data = data.get('audio', '')
+                        if audio_data:
+                            await openai_service.send_audio_to_realtime(openai_ws, audio_data)
+                    
+                    elif message_type == 'stop':
+                        logger.info("Test conversation: Stop requested")
+                        break
+                        
+            except WebSocketDisconnect:
+                logger.info("Test conversation: Browser WebSocket disconnected")
+            except Exception as e:
+                logger.error(f"Error in browser_to_openai: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        
+        # Task for receiving from OpenAI and sending to browser
+        async def openai_to_browser():
+            try:
+                logger.info("Test conversation: openai_to_browser task started")
+                last_transcript = ""
+                
+                async for message in openai_ws:
+                    data = json.loads(message)
+                    event_type = data.get('type')
+                    
+                    # Handle audio responses from OpenAI
+                    if event_type == 'response.audio.delta':
+                        audio_delta = data.get('delta')
+                        if audio_delta:
+                            # Send audio to browser
+                            await websocket.send_json({
+                                'type': 'audio',
+                                'audio_delta': audio_delta
+                            })
+                    
+                    # Handle transcripts for RAG queries
+                    elif event_type == 'conversation.item.input_audio_transcription.completed':
+                        transcript = data.get('transcript', '')
+                        if transcript and transcript != last_transcript:
+                            last_transcript = transcript
+                            logger.info(f"Test conversation - User said: {transcript}")
+                            
+                            # Send transcript to browser
+                            await websocket.send_json({
+                                'type': 'transcript',
+                                'text': transcript
+                            })
+                            
+                            # Query Pinecone for context
+                            try:
+                                await websocket.send_json({
+                                    'type': 'rag_query',
+                                    'query': transcript
+                                })
+                                
+                                context = await rag_service.query_context(
+                                    query_text=transcript,
+                                    namespace=namespace,
+                                    top_k=5
+                                )
+                                logger.info(f"Test conversation - Retrieved context (length: {len(context)})")
+                                
+                                # Count chunks
+                                chunk_count = context.count('[Result') if context else 0
+                                await websocket.send_json({
+                                    'type': 'rag_result',
+                                    'chunks': chunk_count,
+                                    'context_length': len(context)
+                                })
+                                
+                                # Inject context into conversation
+                                if context and "No relevant context" not in context:
+                                    await openai_service.inject_context_to_conversation(openai_ws, context)
+                                    
+                            except Exception as e:
+                                logger.error(f"Test conversation - Error querying Pinecone: {e}")
+                                await websocket.send_json({
+                                    'type': 'error',
+                                    'error': f'RAG query failed: {str(e)}'
+                                })
+                    
+                    # Handle response completion
+                    elif event_type == 'response.done':
+                        logger.info("Test conversation: Response completed")
+                        await websocket.send_json({
+                            'type': 'response_done'
+                        })
+                    
+                    # Handle errors
+                    elif event_type == 'error':
+                        error_info = data.get('error', {})
+                        logger.error(f"Test conversation - OpenAI error: {error_info}")
+                        await websocket.send_json({
+                            'type': 'error',
+                            'error': str(error_info)
+                        })
+                        
+            except Exception as e:
+                logger.error(f"Error in openai_to_browser: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                try:
+                    await websocket.send_json({
+                        'type': 'error',
+                        'error': str(e)
+                    })
+                except:
+                    pass
+        
+        # Run both tasks concurrently
+        logger.info("Test conversation: Starting concurrent tasks")
+        try:
+            await asyncio.gather(
+                browser_to_openai(),
+                openai_to_browser(),
+                return_exceptions=True
+            )
+        except Exception as e:
+            logger.error(f"Error in gather: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+        
+    except Exception as e:
+        logger.error(f"Test conversation WebSocket error: {e}")
+        try:
+            await websocket.send_json({
+                'type': 'error',
+                'error': str(e)
+            })
+        except:
+            pass
+    finally:
+        # Clean up
+        if openai_ws:
+            await openai_ws.close()
+            logger.info("Test conversation: OpenAI WebSocket closed")
+        
+        try:
+            await websocket.close()
+            logger.info("Test conversation: Browser WebSocket closed")
+        except:
+            pass
+        
+        logger.info(f"Test conversation session ended")
 
 # Exception handlers
 @app.exception_handler(HTTPException)

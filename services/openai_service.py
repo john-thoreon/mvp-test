@@ -47,7 +47,7 @@ class OpenAIService:
     async def generate_embedding(
         self,
         text: str,
-        model: str = "text-embedding-3-small"
+        model: str = "text-embedding-3-large"
     ) -> List[float]:
         """
         Generate embedding for text using OpenAI.
@@ -93,7 +93,7 @@ class OpenAIService:
             }
             
             logger.info("Connecting to OpenAI Real-time API...")
-            ws = await websockets.connect(ws_url, extra_headers=headers)
+            ws = await websockets.connect(ws_url, additional_headers=headers)
             logger.info("Connected to OpenAI Real-time API")
             
             # Send session configuration if provided
@@ -130,8 +130,8 @@ class OpenAIService:
                 "modalities": ["text", "audio"],
                 "instructions": instructions,
                 "voice": voice,
-                "input_audio_format": "g711_ulaw",
-                "output_audio_format": "g711_ulaw",
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
                 "input_audio_transcription": {
                     "model": "whisper-1"
                 },

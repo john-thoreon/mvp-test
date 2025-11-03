@@ -35,7 +35,7 @@ class RAGService:
         query_text: str,
         namespace: str,
         top_k: int = 5,
-        embedding_model: str = "text-embedding-3-small"
+        embedding_model: str = "text-embedding-3-large"
     ) -> str:
         """
         Query Pinecone for relevant context using RAG.
