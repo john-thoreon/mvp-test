@@ -27,7 +27,11 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:${PORT:-8080}/ || exit 1
 
-# Run FastAPI app with uvicorn and increased ulimit
+# Run FastAPI app with uvicorn and increased ulimit + WebSocket support
 CMD ulimit -n 4096 && uvicorn api_server:app \
     --host 0.0.0.0 \
-    --port ${PORT}
+    --port ${PORT} \
+    --timeout-keep-alive 3600 \
+    --ws-ping-interval 20 \
+    --ws-ping-timeout 20 \
+    --log-level info

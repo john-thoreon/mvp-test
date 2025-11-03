@@ -62,6 +62,9 @@ TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 # OpenAI configuration (for Real-time API and embeddings)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# Cloud Run environment detection
+IS_CLOUD_RUN = os.getenv("K_SERVICE") is not None
+
 # Pinecone configuration
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
@@ -638,6 +641,18 @@ async def root():
     """Health check endpoint"""
     return {"message": "PDF Upload & Workflow API", "status": "active"}
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Cloud Run and monitoring"""
+    from datetime import datetime
+    return {
+        "status": "healthy",
+        "service": "interactive-call-api",
+        "environment": "cloud_run" if IS_CLOUD_RUN else "local",
+        "websocket_support": True,
+        "timestamp": datetime.now().isoformat()
+    }
+
 @app.get("/test", response_class=HTMLResponse)
 async def test_page():
     """Serve the test conversation page"""
@@ -995,7 +1010,15 @@ async def initiate_interactive_call(
         
         # Build WebSocket URL (use request base URL for production)
         base_url = str(request.base_url).rstrip('/')
-        ws_url = base_url.replace('http://', 'ws://').replace('https://', 'wss://')
+        
+        # Force WSS for Cloud Run (run.app domains) or HTTPS
+        if 'run.app' in base_url or base_url.startswith('https://'):
+            ws_url = base_url.replace('https://', 'wss://').replace('http://', 'wss://')
+        else:
+            ws_url = base_url.replace('http://', 'ws://').replace('https://', 'wss://')
+        
+        logger.info(f"Base URL: {base_url}")
+        logger.info(f"WebSocket protocol: {'WSS (secure)' if 'wss://' in ws_url else 'WS (insecure)'}")
         
         # Add parameters to WebSocket URL
         ws_params = []
@@ -1698,6 +1721,31 @@ async def general_exception_handler(request, exc):
         ).dict()
     )
 
+@app.on_event("startup")
+async def startup_event():
+    """Log startup information"""
+    port = int(os.getenv("PORT", 8000))
+    environment = "Cloud Run" if os.getenv("K_SERVICE") else "Local"
+    logger.info("=" * 80)
+    logger.info("🚀 APPLICATION STARTUP")
+    logger.info(f"   - Environment: {environment}")
+    logger.info(f"   - Port: {port}")
+    logger.info(f"   - WebSocket support: Enabled")
+    if os.getenv("K_SERVICE"):
+        logger.info(f"   - Cloud Run Service: {os.getenv('K_SERVICE')}")
+        logger.info(f"   - Cloud Run Revision: {os.getenv('K_REVISION')}")
+    logger.info("=" * 80)
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    logger.info(f"Starting server on 0.0.0.0:{port}")
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        timeout_keep_alive=3600,
+        ws_ping_interval=20,
+        ws_ping_timeout=20,
+        log_level="info"
+    )
