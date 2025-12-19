@@ -1,0 +1,2502 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Depends, Form, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import JSONResponse, Response, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+import os
+import time
+import tempfile
+import json
+import logging
+import threading
+import base64
+import asyncio
+import traceback
+from datetime import datetime
+from pathlib import Path
+from dotenv import load_dotenv
+from google.cloud import pubsub_v1, storage
+from google.api_core import retry
+from google.oauth2 import service_account
+from unstructured_client import UnstructuredClient
+from unstructured_client.models.operations import (
+    ListWorkflowsRequest, ListJobsRequest, RunWorkflowRequest, 
+    ListDestinationsRequest, UpdateDestinationRequest, GetJobRequest
+)
+from unstructured_client.models.shared import UpdateDestinationConnector
+import websockets
+
+# Import our service classes
+from services import TwilioService, OpenAIService, PineconeService, RAGService
+from services.langchain_service import get_langchain_service
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="PDF Upload & Workflow API",
+    description="REST API for uploading PDFs and triggering Unstructured workflows",
+    version="1.0.0"
+)
+
+# Mount static files directory for test page
+static_dir = Path(__file__).parent / "static"
+static_dir.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+# GCP Pub/Sub configuration
+PUBSUB_PROJECT_ID = os.getenv("PUBSUB_PROJECT_ID")
+PUBSUB_TOPIC = os.getenv("PUBSUB_TOPIC", "workflow-jobs")
+PUBSUB_SUBSCRIPTION = os.getenv("PUBSUB_SUBSCRIPTION", "workflow-jobs-sub")
+PUBSUB_CREDENTIALS_PATH = os.getenv("GCP_PUB_SUB_CREDENTIALS")
+PUBSUB_CREDENTIALS_BASE64 = os.getenv("GCP_PUB_SUB_CREDENTIALS_BASE64")
+
+# Twilio configuration
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
+
+# OpenAI configuration (for Real-time API and embeddings)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Cloud Run environment detection
+IS_CLOUD_RUN = os.getenv("K_SERVICE") is not None
+
+# Pinecone configuration
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
+PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT")
+
+# Global job state - thread safe
+current_job_lock = threading.Lock()
+current_job_id = None
+job_queue_count = 0
+
+# Pydantic models for request/response
+class WorkflowInfo(BaseModel):
+    id: str
+    name: str
+    status: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+class UploadResponse(BaseModel):
+    success: bool
+    filename: str
+    gcs_path: str
+    bucket: str
+    size: int
+    job_id: Optional[str] = None
+    workflow_id: str
+    namespace: str
+    message: str
+
+class JobStatus(BaseModel):
+    job_id: str
+    status: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    workflow_name: Optional[str] = None
+
+class ApiError(BaseModel):
+    error: str
+    details: Optional[str] = None
+
+class CallRequest(BaseModel):
+    phone_number: str
+    namespace: Optional[str] = None
+    context_text: Optional[str] = None
+    initial_message: Optional[str] = "Hello, how can I help you today?"
+
+class AlertCallRequest(BaseModel):
+    phone_number: str
+    message: str
+
+class CallResponse(BaseModel):
+    success: bool
+    call_sid: str
+    phone_number: str
+    status: str
+    message: str
+    namespace: Optional[str] = None
+
+# Cached clients (existing GCP and Unstructured)
+_unstructured_client = None
+_gcs_client = None
+_pubsub_publisher = None
+_pubsub_subscriber = None
+
+# Cached service instances (new OOP approach)
+_twilio_service = None
+_openai_service = None
+_pinecone_service = None
+_rag_service = None
+
+def get_unstructured_client():
+    """Get or initialize Unstructured client"""
+    global _unstructured_client
+    if _unstructured_client is None:
+        api_key = os.getenv("UNSTRUCTURED_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=500, detail="UNSTRUCTURED_API_KEY not found")
+        _unstructured_client = UnstructuredClient(api_key_auth=api_key)
+    return _unstructured_client
+
+def get_gcs_client():
+    """Get or initialize GCS client"""
+    global _gcs_client
+    if _gcs_client is None:
+        try:
+            project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
+            
+            # Priority 1: Check for base64-encoded credentials
+            credentials_base64 = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_BASE64")
+            if credentials_base64:
+                credentials_json = base64.b64decode(credentials_base64).decode('utf-8')
+                credentials_info = json.loads(credentials_json)
+                credentials = service_account.Credentials.from_service_account_info(credentials_info)
+                _gcs_client = storage.Client(credentials=credentials, project=project_id)
+            # Priority 2: Check for file path
+            elif os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+                credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+                if os.path.exists(credentials_path):
+                    credentials = service_account.Credentials.from_service_account_file(credentials_path)
+                    _gcs_client = storage.Client(credentials=credentials, project=project_id)
+            # Priority 3: Use default credentials
+            else:
+                _gcs_client = storage.Client(project=project_id)
+                
+        except Exception as e:
+            logger.error(f"Error initializing GCS client: {e}")
+            raise HTTPException(status_code=500, detail=f"GCS initialization failed: {e}")
+    
+    return _gcs_client
+
+def get_pubsub_publisher():
+    """Get or initialize Pub/Sub publisher"""
+    global _pubsub_publisher
+    if _pubsub_publisher is None:
+        try:
+            if PUBSUB_CREDENTIALS_BASE64:
+                credentials_json = base64.b64decode(PUBSUB_CREDENTIALS_BASE64).decode('utf-8')
+                credentials_info = json.loads(credentials_json)
+                credentials = service_account.Credentials.from_service_account_info(credentials_info)
+                _pubsub_publisher = pubsub_v1.PublisherClient(credentials=credentials)
+            elif PUBSUB_CREDENTIALS_PATH and os.path.exists(PUBSUB_CREDENTIALS_PATH):
+                credentials = service_account.Credentials.from_service_account_file(PUBSUB_CREDENTIALS_PATH)
+                _pubsub_publisher = pubsub_v1.PublisherClient(credentials=credentials)
+            else:
+                _pubsub_publisher = pubsub_v1.PublisherClient()
+        except Exception as e:
+            logger.error(f"Error initializing Pub/Sub publisher: {e}")
+            raise HTTPException(status_code=500, detail=f"Pub/Sub initialization failed: {e}")
+    
+    return _pubsub_publisher
+
+def get_twilio_service() -> TwilioService:
+    """Get or initialize Twilio service"""
+    global _twilio_service
+    if _twilio_service is None:
+        try:
+            if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_PHONE_NUMBER:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Twilio credentials not configured (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER)"
+                )
+            _twilio_service = TwilioService(
+                account_sid=TWILIO_ACCOUNT_SID,
+                auth_token=TWILIO_AUTH_TOKEN,
+                phone_number=TWILIO_PHONE_NUMBER
+            )
+            logger.info("Twilio service initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing Twilio service: {e}")
+            raise HTTPException(status_code=500, detail=f"Twilio initialization failed: {e}")
+    
+    return _twilio_service
+
+def get_openai_service() -> OpenAIService:
+    """Get or initialize OpenAI service"""
+    global _openai_service
+    if _openai_service is None:
+        try:
+            if not OPENAI_API_KEY:
+                raise HTTPException(status_code=500, detail="OPENAI_API_KEY not found")
+            _openai_service = OpenAIService(api_key=OPENAI_API_KEY)
+            logger.info("OpenAI service initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing OpenAI service: {e}")
+            raise HTTPException(status_code=500, detail=f"OpenAI initialization failed: {e}")
+    
+    return _openai_service
+
+def get_pinecone_service() -> PineconeService:
+    """Get or initialize Pinecone service"""
+    global _pinecone_service
+    if _pinecone_service is None:
+        try:
+            if not PINECONE_API_KEY or not PINECONE_INDEX_NAME:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Pinecone credentials not configured (PINECONE_API_KEY, PINECONE_INDEX_NAME)"
+                )
+            _pinecone_service = PineconeService(
+                api_key=PINECONE_API_KEY,
+                index_name=PINECONE_INDEX_NAME,
+                environment=PINECONE_ENVIRONMENT
+            )
+            logger.info("Pinecone service initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing Pinecone service: {e}")
+            raise HTTPException(status_code=500, detail=f"Pinecone initialization failed: {e}")
+    
+    return _pinecone_service
+
+def get_rag_service() -> RAGService:
+    """Get or initialize RAG service"""
+    global _rag_service
+    if _rag_service is None:
+        try:
+            openai_service = get_openai_service()
+            pinecone_service = get_pinecone_service()
+            _rag_service = RAGService(
+                openai_service=openai_service,
+                pinecone_service=pinecone_service
+            )
+            logger.info("RAG service initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing RAG service: {e}")
+            raise HTTPException(status_code=500, detail=f"RAG initialization failed: {e}")
+    
+    return _rag_service
+
+# Core functions from simple_app.py
+def get_workflows(client):
+    """Get available workflows"""
+    try:
+        response = client.workflows.list_workflows(
+            request=ListWorkflowsRequest()
+        )
+        workflows = response.response_list_workflows if response.response_list_workflows else []
+        logger.info(f"Found {len(workflows)} workflows")
+        return workflows
+    except Exception as e:
+        logger.error(f"Error fetching workflows: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching workflows: {e}")
+
+def get_active_workflow(client):
+    """Get the first active workflow"""
+    workflows = get_workflows(client)
+    active_workflows = [w for w in workflows if w.status.lower() == 'active']
+    if not active_workflows:
+        raise HTTPException(status_code=404, detail="No active workflows found")
+    return active_workflows[0]
+
+def upload_file_to_gcs(gcs_client, bucket_name: str, file_content: bytes, filename: str, custom_folder: Optional[str] = None):
+    """Upload file to Google Cloud Storage"""
+    try:
+        logger.info(f"Starting upload: {filename} to bucket {bucket_name}")
+        
+        bucket = gcs_client.bucket(bucket_name)
+        
+        # Use custom folder or default path
+        upload_path = f"{custom_folder}/" if custom_folder else "protocols/dev/"
+        blob_name = f"{upload_path}{filename}"
+        blob = bucket.blob(blob_name)
+        
+        # Upload the file content
+        blob.upload_from_string(file_content, content_type='application/pdf')
+        logger.info(f"Upload completed: {blob_name}")
+        
+        # Get file metadata
+        blob.reload()
+        
+        result = {
+            'success': True,
+            'blob_name': blob_name,
+            'bucket': bucket_name,
+            'public_url': f"gs://{bucket_name}/{blob_name}",
+            'size': blob.size,
+            'created': blob.time_created.isoformat() if blob.time_created else None,
+            'updated': blob.updated.isoformat() if blob.updated else None
+        }
+        
+        logger.info(f"Upload result: {result}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error uploading to GCS: {e}")
+        raise HTTPException(status_code=500, detail=f"GCS upload failed: {e}")
+
+def copy_file_in_gcs(gcs_client, bucket_name: str, source_path: str, target_path: str):
+    """Copy a file from one location to another within GCS"""
+    try:
+        logger.info(f"Copying file in GCS: {source_path} → {target_path}")
+        
+        bucket = gcs_client.bucket(bucket_name)
+        
+        # Get source blob
+        source_blob = bucket.blob(source_path)
+        
+        if not source_blob.exists():
+            logger.error(f"Source file does not exist: {source_path}")
+            return {'success': False, 'error': 'Source file not found'}
+        
+        # Copy to target location
+        target_blob = bucket.blob(target_path)
+        target_blob.rewrite(source_blob)
+        
+        # Verify copy succeeded
+        if not target_blob.exists():
+            logger.error(f"Failed to copy file to: {target_path}")
+            return {'success': False, 'error': 'Copy verification failed'}
+        
+        logger.info(f"✅ File copied successfully to: {target_path}")
+        
+        return {
+            'success': True,
+            'source_path': source_path,
+            'target_path': target_path,
+            'bucket': bucket_name
+        }
+        
+    except Exception as e:
+        logger.error(f"Error copying file in GCS: {e}")
+        return {'success': False, 'error': str(e)}
+
+def wait_for_workflow_completion(client, job_id: str, max_wait_time: int = 600, check_interval: int = 15) -> bool:
+    """Wait until a specific workflow job completes"""
+    try:
+        elapsed_time = 0
+        
+        while elapsed_time < max_wait_time:
+            try:
+                job_status = check_job_status(client, job_id)
+                if job_status and hasattr(job_status, 'status'):
+                    status = job_status.status.lower()
+                    logger.info(f"Job {job_id} status: {status}")
+                    
+                    if status in ['completed', 'failed', 'cancelled', 'finished']:
+                        logger.info(f"✅ Job {job_id} completed with status: {status}")
+                        return True
+            except Exception as e:
+                logger.error(f"Error checking job status: {e}")
+            
+            # Wait before next check
+            time.sleep(check_interval)
+            elapsed_time += check_interval
+            
+            if elapsed_time % 60 == 0:  # Log every minute
+                logger.info(f"Waiting for job {job_id} completion... ({elapsed_time}/{max_wait_time}s)")
+        
+        logger.warning(f"⏱️ Timeout waiting for job {job_id} completion ({max_wait_time}s)")
+        return False
+        
+    except Exception as e:
+        logger.error(f"Error in wait_for_workflow_completion: {e}")
+        return False
+
+def trigger_workflow(unstructured_client, workflow_id: str, namespace: Optional[str] = None, pinecone_connector_id: Optional[str] = None, retry_count: int = 0, max_retries: int = 3):
+    """Manually trigger a workflow to process uploaded files with optional namespace update and rate limiting protection"""
+    try:
+        # Rate limiting protection with exponential backoff
+        if retry_count > 0:
+            wait_time = min(2 ** retry_count, 30)  # Exponential backoff, max 30 seconds
+            logger.info(f"Retry {retry_count}/{max_retries}, waiting {wait_time}s before retry...")
+            time.sleep(wait_time)
+        
+        # If namespace is provided, update the Pinecone connector first
+        if namespace and pinecone_connector_id:
+            logger.info(f"🔄 Updating Pinecone namespace to: `{namespace}`")
+            logger.info(f"   • Connector ID: {pinecone_connector_id}")
+            logger.info(f"   • Target Namespace: {namespace}")
+            namespace_result = update_pinecone_namespace(
+                unstructured_client, 
+                pinecone_connector_id, 
+                namespace
+            )
+            
+            if not namespace_result.get('success'):
+                logger.warning("⚠️ Namespace update failed, proceeding with current namespace")
+                logger.warning(f"   • Error: {namespace_result.get('error', 'Unknown error')}")
+            else:
+                logger.info(f"✅ Namespace updated to: `{namespace}`")
+        elif namespace and not pinecone_connector_id:
+            logger.warning(f"⚠️ Namespace '{namespace}' provided but no Pinecone connector found")
+        elif not namespace:
+            logger.info("ℹ️ No namespace provided, using default Pinecone namespace")
+        
+        logger.info(f"Triggering workflow {workflow_id}")
+        
+        # Print workflow input details
+        print(f"\n=== WORKFLOW EXECUTION STARTED ===")
+        print(f"📥 Workflow Input Details:")
+        print(f"   • Workflow ID: {workflow_id}")
+        print(f"   • Namespace: {namespace or 'default'}")
+        print(f"   • Pinecone Connector ID: {pinecone_connector_id or 'N/A'}")
+        print(f"   • Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Create the workflow run request (only workflow_id is supported)
+        response = unstructured_client.workflows.run_workflow(
+            request=RunWorkflowRequest(
+                workflow_id=workflow_id
+            )
+        )
+        
+        if response and hasattr(response, 'raw_response'):
+            logger.info(f"Workflow triggered successfully: {response.raw_response}")
+            
+            # Try to extract job information from response
+            job_info = None
+            if hasattr(response, 'job_information'):
+                job_info = response.job_information
+            elif hasattr(response, 'response_run_workflow'):
+                job_info = response.response_run_workflow
+            
+            if job_info:
+                job_id = getattr(job_info, 'id', 'Unknown')
+                job_status = getattr(job_info, 'status', 'Unknown')
+                
+                # Print workflow output details
+                print(f"\n📤 Workflow Output Details:")
+                print(f"   • Job ID: {job_id}")
+                print(f"   • Initial Status: {job_status}")
+                print(f"   • Response Type: {type(response).__name__}")
+                print(f"   • Job Info: {job_info}")
+                print(f"   • Success: True")
+                print(f"=== WORKFLOW EXECUTION COMPLETED ===\n")
+                
+                logger.info(f"✅ Workflow triggered successfully!")
+                logger.info(f"📋 Job ID: {job_id}")
+                logger.info(f"🔄 Initial Status: {job_status}")
+                if namespace:
+                    logger.info(f"🏷️ Using namespace: `{namespace}`")
+                return {'success': True, 'job_id': job_id, 'job_info': job_info, 'namespace': namespace}
+            else:
+                # Print workflow output details for case without job info
+                print(f"\n📤 Workflow Output Details:")
+                print(f"   • Response Type: {type(response).__name__}")
+                print(f"   • Raw Response: {getattr(response, 'raw_response', 'N/A')}")
+                print(f"   • Success: True")
+                print(f"   • Note: Job details available in monitoring")
+                print(f"=== WORKFLOW EXECUTION COMPLETED ===\n")
+                
+                logger.info(f"✅ Workflow triggered successfully!")
+                logger.info("📋 Job details will be available in workflow monitoring")
+                if namespace:
+                    logger.info(f"🏷️ Using namespace: `{namespace}`")
+                return {'success': True, 'response': response, 'namespace': namespace}
+        else:
+            # Print workflow output for basic success case
+            print(f"\n📤 Workflow Output Details:")
+            print(f"   • Response: Basic success (no detailed response object)")
+            print(f"   • Success: True")
+            print(f"=== WORKFLOW EXECUTION COMPLETED ===\n")
+            
+            logger.info(f"✅ Workflow trigger request sent")
+            return {'success': True, 'namespace': namespace}
+            
+    except Exception as e:
+        # Check if it's a rate limit error (429)
+        error_str = str(e)
+        if "429" in error_str or "Rate limit" in error_str:
+            if retry_count < max_retries:
+                logger.warning(f"Rate limit hit, retrying... ({retry_count + 1}/{max_retries})")
+                return trigger_workflow(
+                    unstructured_client, 
+                    workflow_id, 
+                    namespace, 
+                    pinecone_connector_id, 
+                    retry_count + 1,
+                    max_retries
+                )
+            else:
+                logger.error(f"Max retries reached for rate limiting")
+                return {'success': False, 'error': f"Rate limit exceeded after {max_retries} retries"}
+        
+        # Print workflow error details
+        print(f"\n❌ WORKFLOW EXECUTION FAILED")
+        print(f"📤 Error Details:")
+        print(f"   • Error Type: {type(e).__name__}")
+        print(f"   • Error Message: {str(e)}")
+        print(f"   • Success: False")
+        print(f"=== WORKFLOW EXECUTION COMPLETED ===\n")
+        
+        logger.error(f"Error triggering workflow: {e}")
+        return {'success': False, 'error': str(e)}
+
+def add_job_to_queue(job_data: Dict[str, Any]):
+    """Add a job to Pub/Sub queue"""
+    try:
+        publisher = get_pubsub_publisher()
+        topic_path = publisher.topic_path(PUBSUB_PROJECT_ID, PUBSUB_TOPIC)
+        
+        # Serialize job data to JSON bytes
+        message_data = json.dumps(job_data).encode('utf-8')
+        
+        # Publish message
+        future = publisher.publish(topic_path, message_data)
+        message_id = future.result()  # Wait for publish to complete
+        
+        global job_queue_count
+        job_queue_count += 1
+        logger.info(f"Job added to queue: {job_data['filename']} (Message ID: {message_id})")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to add job to queue: {e}")
+        return False
+
+def is_job_running(client) -> bool:
+    """Check if any workflow job is currently running"""
+    global current_job_id, current_job_lock
+    
+    with current_job_lock:
+        if current_job_id:
+            try:
+                job_status = check_job_status(client, current_job_id)
+                if job_status and hasattr(job_status, 'status'):
+                    status = job_status.status.lower()
+                    if status in ['completed', 'failed', 'cancelled', 'finished']:
+                        logger.info(f"Job {current_job_id} completed with status: {status}")
+                        current_job_id = None
+                        return False
+                    return True
+            except Exception as e:
+                logger.error(f"Error checking job status: {e}")
+                current_job_id = None
+        
+        return False
+
+def wait_for_current_workflow(client, max_wait_time: int = 600, check_interval: int = 15) -> bool:
+    """Wait for any currently running workflow to finish"""
+    try:
+        elapsed_time = 0
+        
+        while elapsed_time < max_wait_time:
+            if not is_job_running(client):
+                logger.info("No workflow currently running, proceeding...")
+                return True
+            
+            logger.info(f"Workflow is running, waiting... ({elapsed_time}/{max_wait_time}s)")
+            time.sleep(check_interval)
+            elapsed_time += check_interval
+        
+        logger.warning(f"⏱️ Timeout waiting for workflow ({max_wait_time}s), proceeding anyway...")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error waiting for workflow: {e}")
+        return True
+
+def process_two_stage_workflow(client, gcs_client, job_data: Dict[str, Any]) -> bool:
+    """
+    Process a two-stage workflow:
+    1. Wait for any currently running workflow to finish
+    2. Copy file to dev/unstructured.io/
+    3. Trigger workflow for files in dev/unstructured.io/
+    """
+    global current_job_id, current_job_lock
+    
+    try:
+        logger.info(f"=== Starting Two-Stage Workflow for {job_data['filename']} ===")
+        
+        # Extract job data
+        filename = job_data['filename']
+        source_gcs_path = job_data['gcs_path']
+        bucket_name = job_data['bucket']
+        workflow_id = job_data['workflow_id']
+        namespace = job_data.get('namespace')
+        
+        # Get Pinecone connector if namespace provided
+        pinecone_connector_id = None
+        if namespace:
+            try:
+                pinecone_connectors = get_pinecone_connectors(client)
+                if pinecone_connectors:
+                    pinecone_connector_id = pinecone_connectors[0].id
+                    logger.info(f"Using Pinecone connector: {pinecone_connector_id}")
+            except Exception as e:
+                logger.warning(f"Could not get Pinecone connector: {e}")
+        
+        # Stage 1: Wait for any currently running workflow to finish
+        logger.info(f"Stage 1: Checking if any workflow is currently running...")
+        if is_job_running(client):
+            logger.info("Workflow is running, waiting for completion...")
+            wait_for_current_workflow(client)
+        else:
+            logger.info("No workflow currently running")
+        
+        # Stage 2: Copy file to dev/unstructured.io/
+        logger.info(f"Stage 2: Copying file to dev/unstructured.io/")
+        target_path = f"dev/unstructured.io/{filename}"
+        
+        copy_result = copy_file_in_gcs(gcs_client, bucket_name, source_gcs_path, target_path)
+        
+        if not copy_result.get('success'):
+            logger.error(f"Stage 2 failed: Could not copy file to {target_path}")
+            return False
+        
+        logger.info(f"✅ Stage 2: File copied to {target_path}")
+        
+        # Stage 3: Trigger workflow for dev/unstructured.io/
+        logger.info(f"Stage 3: Triggering workflow for dev/unstructured.io/")
+        workflow_result = trigger_workflow(
+            client,
+            workflow_id,
+            namespace=namespace,
+            pinecone_connector_id=pinecone_connector_id
+        )
+        
+        if not workflow_result.get('success'):
+            logger.error(f"Stage 3 failed: Workflow trigger failed")
+            return False
+        
+        # Track the job ID
+        job_id = workflow_result.get('job_id')
+        if job_id:
+            with current_job_lock:
+                current_job_id = job_id
+            logger.info(f"✅ Stage 3: Workflow triggered with job_id: {job_id}")
+        else:
+            logger.info(f"✅ Stage 3: Workflow triggered successfully")
+        
+        logger.info(f"=== Two-Stage Workflow Completed for {filename} ===")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error in two-stage workflow: {e}")
+        return False
+
+def get_destination_connectors(client):
+    """Get available destination connectors"""
+    try:
+        response = client.destinations.list_destinations(
+            request=ListDestinationsRequest()
+        )
+        destinations = response.response_list_destinations if response.response_list_destinations else []
+        logger.info(f"Found {len(destinations)} destination connectors")
+        return destinations
+    except Exception as e:
+        logger.error(f"Error fetching destination connectors: {e}")
+        return []
+
+def get_pinecone_connectors(client):
+    """Get Pinecone destination connectors specifically"""
+    destinations = get_destination_connectors(client)
+    pinecone_connectors = [d for d in destinations if getattr(d, 'type', '').lower() == 'pinecone']
+    logger.info(f"Found {len(pinecone_connectors)} Pinecone connectors")
+    return pinecone_connectors
+
+def update_pinecone_namespace(client, connector_id, new_namespace, connector_config=None):
+    """Update the namespace for a Pinecone destination connector"""
+    try:
+        logger.info(f"Updating Pinecone connector {connector_id} namespace to: {new_namespace}")
+        
+        # Get current connector details if config not provided
+        if not connector_config:
+            destinations = get_destination_connectors(client)
+            connector = next((d for d in destinations if d.id == connector_id), None)
+            if not connector:
+                raise Exception(f"Connector {connector_id} not found")
+            connector_config = getattr(connector, 'config', None)
+        
+        # Convert Pydantic model to dict and update with new namespace
+        if hasattr(connector_config, 'model_dump'):
+            # Handle Pydantic v2 model
+            updated_config = connector_config.model_dump()
+        elif hasattr(connector_config, 'dict'):
+            # Handle Pydantic v1 model
+            updated_config = connector_config.dict()
+        elif hasattr(connector_config, '__dict__'):
+            # Handle other object types
+            updated_config = {}
+            for key, value in connector_config.__dict__.items():
+                if not key.startswith('_') and not callable(value):
+                    updated_config[key] = value
+        else:
+            # Handle dict-like object
+            updated_config = dict(connector_config) if connector_config else {}
+        
+        # Ensure all required Pinecone configuration fields are present
+        # Get required values from environment or preserve existing
+        pinecone_index = os.getenv("PINECONE_INDEX_NAME")
+        pinecone_api_key = os.getenv("PINECONE_API_KEY")
+        
+        # Validate required fields
+        if not pinecone_index:
+            raise Exception("PINECONE_INDEX_NAME environment variable is required")
+        if not pinecone_api_key:
+            raise Exception("PINECONE_API_KEY environment variable is required")
+        
+        # Build complete configuration with all required fields
+        complete_config = {
+            "index_name": pinecone_index,
+            "namespace": new_namespace,
+            "api_key": pinecone_api_key,
+            "batch_size": updated_config.get("batch_size", 50)  # Default to 50 if not set
+        }
+        
+        # Preserve any additional configuration fields that might exist
+        for key, value in updated_config.items():
+            if key not in complete_config and value is not None:
+                complete_config[key] = value
+        
+        logger.info(f"Sending Pinecone config update: {complete_config}")
+        logger.info(f"Config keys: {list(complete_config.keys())}")
+        
+        # Create update request with corrected structure
+        response = client.destinations.update_destination(
+            request=UpdateDestinationRequest(
+                destination_id=connector_id,  # ✅ FIXED: destination_id inside the request
+                update_destination_connector=UpdateDestinationConnector(
+                    config=complete_config
+                )
+            )
+        )
+        
+        if response:
+            logger.info(f"Successfully updated namespace to: {new_namespace}")
+            return {'success': True, 'namespace': new_namespace}
+        else:
+            raise Exception("Update request returned no response")
+            
+    except Exception as e:
+        logger.error(f"Error updating Pinecone namespace: {e}")
+        return {'success': False, 'error': str(e)}
+
+def check_job_status(client, job_id):
+    """Check the status of a workflow job"""
+    try:
+        response = client.jobs.get_job(
+            request=GetJobRequest(job_id=job_id)
+        )
+        return response.job_information if response else None
+    except Exception as e:
+        logger.error(f"Error checking job status: {e}")
+        return None
+
+def check_workflow_jobs(client, workflow_id: str, limit: int = 10):
+    """Check recent jobs for a workflow - using exact pattern from run_workflow_test.py"""
+    try:
+        # Use the exact same pattern as the working run_workflow_test.py
+        jobs_response = client.jobs.list_jobs(
+            request=ListJobsRequest(workflow_id=workflow_id)
+        )
+        
+        if jobs_response.response_list_jobs:
+            # Sort by creation time (most recent first) - same as working code
+            jobs = sorted(jobs_response.response_list_jobs,
+                         key=lambda j: j.created_at or "", reverse=True)
+            logger.info(f"Found {len(jobs)} jobs for workflow {workflow_id}")
+            return jobs[:limit]
+        else:
+            logger.info(f"No jobs found for workflow {workflow_id}")
+            return []
+    except Exception as e:
+        logger.error(f"Error checking jobs: {e}")
+        return []
+
+# Twilio AI Calling Functions (now using services)
+
+async def query_pinecone_context(query_text: str, namespace: str, top_k: int = 5) -> str:
+    """
+    Query Pinecone for relevant context using RAG.
+    This is a wrapper around RAGService for backward compatibility.
+    
+    Args:
+        query_text: The text to search for
+        namespace: Pinecone namespace to search in
+        top_k: Number of results to retrieve
+        
+    Returns:
+        Formatted context string from top results
+    """
+    try:
+        rag_service = get_rag_service()
+        return await rag_service.query_context(
+            query_text=query_text,
+            namespace=namespace,
+            top_k=top_k
+        )
+    except Exception as e:
+        logger.error(f"Error in query_pinecone_context: {e}")
+        return f"Error retrieving context: {str(e)}"
+
+# Helper function for context-based function calling
+def execute_context_function(function_name: str, arguments: dict, context: str) -> str:
+    """
+    Execute a function call with the provided context.
+    This extracts structured information from the context based on the function.
+    
+    Args:
+        function_name: Name of the function to execute
+        arguments: Function arguments
+        context: The context data to search/analyze
+        
+    Returns:
+        Function result as a string
+    """
+    try:
+        if function_name == "get_summary":
+            aspect = arguments.get("aspect", "overall")
+            
+            # Extract summary based on aspect
+            if aspect == "overall":
+                # Look for summary section
+                if "=== SUMMARY ===" in context:
+                    summary_start = context.find("=== SUMMARY ===")
+                    # Find the next section marker or take next 500 chars
+                    next_section = context.find("\n===", summary_start + 15)
+                    if next_section > summary_start:
+                        return context[summary_start:next_section].strip()
+                    else:
+                        return context[summary_start:summary_start + 500].strip()
+                return "I don't see a summary section in the data provided. Can you ask me about specific aspects?"
+            
+            elif aspect == "by_site":
+                if "=== DEVIATIONS BY SITE ===" in context:
+                    site_start = context.find("=== DEVIATIONS BY SITE ===")
+                    next_section = context.find("\n===", site_start + 26)
+                    if next_section > site_start:
+                        return context[site_start:next_section].strip()
+                    else:
+                        return context[site_start:site_start + 1000].strip()
+                return "I don't see site-based breakdown in the data."
+            
+            elif aspect == "by_type":
+                if "=== DEVIATIONS BY TYPE ===" in context:
+                    type_start = context.find("=== DEVIATIONS BY TYPE ===")
+                    next_section = context.find("=== DEVIATIONS BY SITE ===", type_start)
+                    if next_section > type_start:
+                        return context[type_start:next_section].strip()
+                    else:
+                        return context[type_start:type_start + 2000].strip()
+                return "I don't see type-based breakdown in the data."
+            
+            elif aspect == "by_subject":
+                if "=== AFFECTED SUBJECTS ===" in context:
+                    subject_start = context.find("=== AFFECTED SUBJECTS ===")
+                    next_section = context.find("\n===", subject_start + 25)
+                    if next_section > subject_start:
+                        return context[subject_start:next_section].strip()
+                    else:
+                        return context[subject_start:subject_start + 800].strip()
+                return "I don't see subject breakdown in the data."
+            
+            return f"I can't provide a summary for '{aspect}'. Try asking for 'overall', 'by_site', 'by_type', or 'by_subject'."
+        
+        elif function_name == "search_context":
+            query = arguments.get("query", "").lower()
+            search_type = arguments.get("search_type", "general")
+            
+            if not query:
+                return "Please specify what you'd like to search for."
+            
+            # Split context into sections
+            sections = context.split("===")
+            relevant_sections = []
+            
+            for i, section in enumerate(sections):
+                section_lower = section.lower()
+                
+                # Check if query appears in this section
+                if query in section_lower:
+                    # Include section title if available
+                    if i > 0:
+                        title = sections[i-1].strip().split('\n')[-1] if sections[i-1].strip() else ""
+                        relevant_sections.append(f"=== {title} ===\n{section.strip()}")
+                    else:
+                        relevant_sections.append(section.strip())
+            
+            if relevant_sections:
+                # Limit to first 2 most relevant sections
+                result = "\n\n".join(relevant_sections[:2])
+                # Limit total length
+                if len(result) > 1500:
+                    result = result[:1500] + "\n... (truncated for brevity)"
+                return result
+            
+            return f"I couldn't find specific information about '{query}' in the data. Could you try rephrasing or asking about something else?"
+        
+        elif function_name == "get_specific_deviation":
+            subject_id = arguments.get("subject_id", "").upper()
+            site_id = arguments.get("site_id", "")
+            deviation_type = arguments.get("deviation_type", "")
+            
+            search_term = subject_id or site_id or deviation_type
+            if not search_term:
+                return "Please specify a subject ID, site ID, or deviation type."
+            
+            # Search for the specific information
+            lines = context.split('\n')
+            relevant_lines = []
+            context_window = 5  # lines before and after
+            
+            for i, line in enumerate(lines):
+                if search_term.lower() in line.lower():
+                    # Add surrounding context
+                    start = max(0, i - context_window)
+                    end = min(len(lines), i + context_window + 1)
+                    relevant_lines.append("\n".join(lines[start:end]))
+                    relevant_lines.append("---")
+            
+            if relevant_lines:
+                result = "\n".join(relevant_lines[:500])  # Limit response size
+                if len(result) > 1500:
+                    result = result[:1500] + "\n... (showing first few matches)"
+                return result
+            
+            return f"I couldn't find information about '{search_term}' in the data."
+        
+        elif function_name == "count_and_filter":
+            filter_type = arguments.get("filter_type")
+            filter_value = arguments.get("filter_value", "")
+            
+            if not filter_type:
+                return "Please specify what you'd like to count or filter."
+            
+            # Count occurrences
+            lines = context.split('\n')
+            matching_lines = []
+            count = 0
+            
+            search_term = filter_value.lower() if filter_value else filter_type.lower()
+            
+            for line in lines:
+                if search_term in line.lower():
+                    count += 1
+                    matching_lines.append(line.strip())
+            
+            if count > 0:
+                result = f"Found {count} instance(s) related to '{search_term}':\n\n"
+                # Show first 10 matches
+                result += "\n".join(matching_lines[:10])
+                if len(matching_lines) > 10:
+                    result += f"\n... and {len(matching_lines) - 10} more"
+                return result
+            
+            return f"No instances found for '{search_term}'."
+        
+        return f"Unknown function: {function_name}"
+    
+    except Exception as e:
+        logger.error(f"Error executing function {function_name}: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return f"I encountered an error while processing that request: {str(e)}"
+
+# API Routes
+@app.get("/")
+async def root():
+    """Health check endpoint"""
+    return {"message": "PDF Upload & Workflow API", "status": "active"}
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Cloud Run and monitoring"""
+    from datetime import datetime
+    return {
+        "status": "healthy",
+        "service": "interactive-call-api",
+        "environment": "cloud_run" if IS_CLOUD_RUN else "local",
+        "websocket_support": True,
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/test", response_class=HTMLResponse)
+async def test_page():
+    """Serve the test conversation page"""
+    html_file = Path(__file__).parent / "static" / "test_conversation.html"
+    if html_file.exists():
+        return HTMLResponse(content=html_file.read_text(), status_code=200)
+    else:
+        return HTMLResponse(
+            content="<h1>Test page not found</h1><p>Please ensure static/test_conversation.html exists.</p>",
+            status_code=404
+        )
+
+@app.get("/workflows", response_model=List[WorkflowInfo])
+async def list_workflows():
+    """List all available workflows"""
+    client = get_unstructured_client()
+    workflows = get_workflows(client)
+    
+    return [
+        WorkflowInfo(
+            id=w.id,
+            name=w.name,
+            status=w.status,
+            created_at=getattr(w, 'created_at', None).isoformat() if getattr(w, 'created_at', None) else None,
+            updated_at=getattr(w, 'updated_at', None).isoformat() if getattr(w, 'updated_at', None) else None
+        )
+        for w in workflows
+    ]
+
+@app.get("/workflows/active", response_model=WorkflowInfo)
+async def get_active_workflow_info():
+    """Get the first active workflow"""
+    client = get_unstructured_client()
+    workflow = get_active_workflow(client)
+    
+    return WorkflowInfo(
+        id=workflow.id,
+        name=workflow.name,
+        status=workflow.status,
+        created_at=getattr(workflow, 'created_at', None).isoformat() if getattr(workflow, 'created_at', None) else None,
+        updated_at=getattr(workflow, 'updated_at', None).isoformat() if getattr(workflow, 'updated_at', None) else None
+    )
+
+@app.get("/connectors/pinecone")
+async def list_pinecone_connectors():
+    """List Pinecone destination connectors"""
+    client = get_unstructured_client()
+    connectors = get_pinecone_connectors(client)
+    
+    return [
+        {
+            "id": getattr(c, 'id', 'Unknown'),
+            "name": getattr(c, 'name', 'Unnamed'),
+            "type": getattr(c, 'type', 'Unknown'),
+            "config": {
+                "namespace": getattr(getattr(c, 'config', None), 'namespace', 'default') if getattr(c, 'config', None) else 'default',
+                "index_name": getattr(getattr(c, 'config', None), 'index_name', 'Unknown') if getattr(c, 'config', None) else 'Unknown'
+            }
+        }
+        for c in connectors
+    ]
+
+@app.post("/upload", response_model=UploadResponse)
+async def upload_pdf(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    namespace: Optional[str] = Form(None),
+    workflow_id: Optional[str] = Form(None),
+    custom_folder: Optional[str] = Form(None)
+):
+    """Upload a PDF file and trigger workflow processing"""
+    
+    # Log user request data
+    logger.info(f"\n=== UPLOAD REQUEST RECEIVED ===")
+    logger.info(f"📥 User Request Details:")
+    logger.info(f"   • Filename: {file.filename}")
+    logger.info(f"   • File Size: {file.size if hasattr(file, 'size') else 'Unknown'} bytes")
+    logger.info(f"   • Content Type: {file.content_type}")
+    logger.info(f"   • Namespace: {namespace}")
+    logger.info(f"   • Workflow ID: {workflow_id}")
+    logger.info(f"   • Custom Folder: {custom_folder}")
+    logger.info(f"   • Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"=== END REQUEST DETAILS ===\n")
+    
+    # Validate file type
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+    
+    try:
+        # Get clients
+        client = get_unstructured_client()
+        gcs_client = get_gcs_client()
+        bucket_name = os.getenv("GCS_BUCKET_NAME")
+        
+        if not bucket_name:
+            raise HTTPException(status_code=500, detail="GCS_BUCKET_NAME not configured")
+        
+        # Get active workflow if not specified
+        if not workflow_id:
+            active_workflow = get_active_workflow(client)
+            workflow_id = active_workflow.id
+            workflow_name = active_workflow.name
+        else:
+            workflows = get_workflows(client)
+            workflow = next((w for w in workflows if w.id == workflow_id), None)
+            if not workflow:
+                raise HTTPException(status_code=404, detail=f"Workflow {workflow_id} not found")
+            workflow_name = workflow.name
+        
+        # Read file content
+        file_content = await file.read()
+        
+        # Upload to GCS
+        upload_result = upload_file_to_gcs(
+            gcs_client, 
+            bucket_name, 
+            file_content, 
+            file.filename,
+            custom_folder
+        )
+        
+        if not upload_result.get('success'):
+            raise HTTPException(status_code=500, detail="Failed to upload to GCS")
+        
+        # Prepare job data
+        job_data = {
+            'filename': file.filename,
+            'gcs_path': upload_result['blob_name'],
+            'bucket': upload_result['bucket'],
+            'workflow_id': workflow_id,
+            'workflow_name': workflow_name,
+            'namespace': namespace,
+            'uploaded_at': time.time()
+        }
+        
+        # Add job to Pub/Sub queue for two-stage workflow processing
+        logger.info(f"Adding {file.filename} to Pub/Sub queue for two-stage workflow")
+        
+        queue_success = add_job_to_queue(job_data)
+        
+        if not queue_success:
+            logger.warning("Failed to add to queue, falling back to immediate processing")
+            # Fallback: trigger workflow immediately if queue fails
+            pinecone_connector_id = None
+            if namespace:
+                try:
+                    pinecone_connectors = get_pinecone_connectors(client)
+                    if pinecone_connectors:
+                        pinecone_connector_id = pinecone_connectors[0].id
+                except Exception as e:
+                    logger.warning(f"Could not get Pinecone connector: {e}")
+            
+            workflow_result = trigger_workflow(
+                client, 
+                workflow_id, 
+                namespace=namespace,
+                pinecone_connector_id=pinecone_connector_id
+            )
+            job_id = workflow_result.get('job_id') if workflow_result.get('success') else None
+        else:
+            logger.info(f"✅ Job added to queue successfully, will be processed by Pub/Sub consumer")
+            job_id = "queued"  # Indicate job is queued
+        
+        # Log final response details
+        logger.info(f"\n=== UPLOAD RESPONSE ===")
+        logger.info(f"📤 Response Details:")
+        logger.info(f"   • Success: True")
+        logger.info(f"   • Filename: {file.filename}")
+        logger.info(f"   • GCS Path: {upload_result['blob_name']}")
+        logger.info(f"   • Bucket: {upload_result['bucket']}")
+        logger.info(f"   • Size: {upload_result['size']} bytes")
+        logger.info(f"   • Job ID: {job_id}")
+        logger.info(f"   • Workflow ID: {workflow_id}")
+        logger.info(f"   • Namespace Used: {namespace}")
+        logger.info(f"=== END RESPONSE ===\n")
+        
+        return UploadResponse(
+            success=True,
+            filename=file.filename,
+            gcs_path=upload_result['blob_name'],
+            bucket=upload_result['bucket'],
+            size=upload_result['size'],
+            job_id=job_id,
+            workflow_id=workflow_id,
+            namespace=namespace,
+            message="File uploaded successfully and workflow triggered"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Upload failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+@app.post("/workflows/{workflow_id}/trigger")
+async def trigger_workflow_manually(
+    workflow_id: str,
+    namespace: Optional[str] = None
+):
+    """Manually trigger a specific workflow"""
+    client = get_unstructured_client()
+    
+    # Verify workflow exists
+    workflows = get_workflows(client)
+    workflow = next((w for w in workflows if w.id == workflow_id), None)
+    if not workflow:
+        raise HTTPException(status_code=404, detail=f"Workflow {workflow_id} not found")
+    
+    # Get Pinecone connector ID if namespace is provided
+    pinecone_connector_id = None
+    if namespace:  # Changed: Remove the "!= default" check
+        try:
+            pinecone_connectors = get_pinecone_connectors(client)
+            if pinecone_connectors:
+                pinecone_connector_id = pinecone_connectors[0].id
+                logger.info(f"Using Pinecone connector: {pinecone_connector_id}")
+                logger.info(f"Will update namespace to: {namespace}")
+        except Exception as e:
+            logger.warning(f"Could not get Pinecone connector: {e}")
+    else:
+        logger.info("No namespace provided, using default Pinecone namespace")
+    
+    result = trigger_workflow(
+        client, 
+        workflow_id, 
+        namespace=namespace,  # Changed: Always pass namespace if provided
+        pinecone_connector_id=pinecone_connector_id
+    )
+    
+    if result.get('success'):
+        return {
+            "success": True,
+            "workflow_id": workflow_id,
+            "job_id": result.get('job_id'),
+            "namespace": namespace,
+            "message": "Workflow triggered successfully"
+        }
+    else:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to trigger workflow: {result.get('error', 'Unknown error')}"
+        )
+
+@app.get("/workflows/{workflow_id}/jobs", response_model=List[JobStatus])
+async def get_workflow_jobs(workflow_id: str, limit: int = 10):
+    """Get recent jobs for a specific workflow"""
+    client = get_unstructured_client()
+    jobs = check_workflow_jobs(client, workflow_id, limit)
+    
+    return [
+        JobStatus(
+            job_id=getattr(job, 'id', 'Unknown'),
+            status=getattr(job, 'status', 'Unknown'),
+            created_at=getattr(job, 'created_at', None).isoformat() if getattr(job, 'created_at', None) else None,
+            updated_at=getattr(job, 'updated_at', None).isoformat() if getattr(job, 'updated_at', None) else None,
+            workflow_name=getattr(job, 'workflow_name', None)
+        )
+        for job in jobs
+    ]
+
+@app.get("/jobs/{job_id}")
+async def get_job_status(job_id: str):
+    """Get status of a specific job"""
+    client = get_unstructured_client()
+    
+    try:
+        response = client.jobs.get_job(job_id)
+        job_info = response.job_information if response else None
+        
+        if job_info:
+            return JobStatus(
+                job_id=getattr(job_info, 'id', job_id),
+                status=getattr(job_info, 'status', 'Unknown'),
+                created_at=getattr(job_info, 'created_at', None).isoformat() if getattr(job_info, 'created_at', None) else None,
+                updated_at=getattr(job_info, 'updated_at', None).isoformat() if getattr(job_info, 'updated_at', None) else None,
+                workflow_name=getattr(job_info, 'workflow_name', None)
+            )
+        else:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+            
+    except Exception as e:
+        logger.error(f"Error getting job status: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting job status: {e}")
+
+@app.get("/status")
+async def get_system_status():
+    """Get overall system status"""
+    global current_job_id, job_queue_count
+    
+    with current_job_lock:
+        active_job_id = current_job_id
+        queue_count = job_queue_count
+    
+    return {
+        "system_status": "operational",
+        "current_job": active_job_id,
+        "jobs_in_queue": queue_count,
+        "timestamp": datetime.now().isoformat()
+    }
+
+# Twilio AI Calling Endpoints
+
+@app.post("/call/interactive", response_model=CallResponse)
+async def initiate_interactive_call(
+    call_request: CallRequest,
+    background_tasks: BackgroundTasks,
+    request: Request
+):
+    """
+    Initiate an interactive AI call with RAG support
+    
+    Args:
+        call_request: Call parameters including phone_number, namespace, initial_message
+        background_tasks: FastAPI background tasks
+        request: Request object to get base URL
+        
+    Returns:
+        CallResponse with call details
+    """
+    try:
+        logger.info(f"\n=== INTERACTIVE CALL REQUEST ===")
+        logger.info(f"Phone Number: {call_request.phone_number}")
+        logger.info(f"Namespace: {call_request.namespace}")
+        logger.info(f"Context Text Length: {len(call_request.context_text) if call_request.context_text else 0}")
+        logger.info(f"Initial Message: {call_request.initial_message}")
+        
+        # Validate that either namespace or context_text is provided
+        if not call_request.namespace and not call_request.context_text:
+            raise HTTPException(
+                status_code=400,
+                detail="Either 'namespace' or 'context_text' must be provided"
+            )
+        
+        # Validate phone number format
+        phone = call_request.phone_number.strip()
+        twilio_service = get_twilio_service()
+        
+        if not twilio_service.validate_phone_number(phone):
+            raise HTTPException(status_code=400, detail="Phone number must be in E.164 format (start with +)")
+        
+        # Build WebSocket URL (use request base URL for production)
+        base_url = str(request.base_url).rstrip('/')
+        
+        # Force WSS for Cloud Run (run.app domains) or HTTPS
+        if 'run.app' in base_url or base_url.startswith('https://'):
+            ws_url = base_url.replace('https://', 'wss://').replace('http://', 'wss://')
+        else:
+            ws_url = base_url.replace('http://', 'ws://').replace('https://', 'wss://')
+        
+        logger.info(f"Base URL: {base_url}")
+        logger.info(f"WebSocket protocol: {'WSS (secure)' if 'wss://' in ws_url else 'WS (insecure)'}")
+        
+        # Add parameters to WebSocket URL
+        ws_params = []
+        if call_request.namespace:
+            ws_params.append(f"namespace={call_request.namespace}")
+        if call_request.context_text:
+            # Store context_text and initial_message in a way they can be retrieved
+            import hashlib
+            context_id = hashlib.md5(call_request.context_text.encode()).hexdigest()
+            # Store in global dict (you might want to use Redis in production)
+            if 'context_store' not in globals():
+                globals()['context_store'] = {}
+            globals()['context_store'][context_id] = {
+                'context': call_request.context_text,
+                'initial_message': call_request.initial_message
+            }
+            ws_params.append(f"context_id={context_id}")
+        
+        # Use path parameter instead of query parameter for better Twilio compatibility
+        if call_request.context_text:
+            websocket_url = f"{ws_url}/ws/twilio-stream/{context_id}"
+        elif call_request.namespace:
+            websocket_url = f"{ws_url}/ws/twilio-stream/namespace/{call_request.namespace}"
+        else:
+            websocket_url = f"{ws_url}/ws/twilio-stream"
+        
+        logger.info(f"WebSocket URL: {websocket_url}")
+        
+        # Generate TwiML using service
+        twiml = twilio_service.generate_interactive_twiml(
+            websocket_url, 
+            call_request.namespace or "direct-context"
+        )
+        
+        # Initiate call using service
+        call_result = twilio_service.initiate_call(
+            to_number=phone,
+            twiml=twiml,
+            status_callback_url=f"{base_url}/webhooks/twilio/call-status"
+        )
+        
+        logger.info(f"Call initiated - SID: {call_result['call_sid']}, Status: {call_result['status']}")
+        logger.info(f"=== END CALL REQUEST ===\n")
+        
+        return CallResponse(
+            success=True,
+            call_sid=call_result['call_sid'],
+            phone_number=phone,
+            status=call_result['status'],
+            message="Interactive call initiated successfully",
+            namespace=call_request.namespace
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error initiating interactive call: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to initiate call: {str(e)}")
+
+@app.post("/call/alert", response_model=CallResponse)
+async def initiate_alert_call(
+    alert_request: AlertCallRequest,
+    background_tasks: BackgroundTasks,
+    request: Request
+):
+    """
+    Initiate a simple alert call that plays a message and hangs up
+    
+    Args:
+        alert_request: Alert parameters including phone_number and message
+        background_tasks: FastAPI background tasks
+        request: Request object to get base URL
+        
+    Returns:
+        CallResponse with call details
+    """
+    try:
+        logger.info(f"\n=== ALERT CALL REQUEST ===")
+        logger.info(f"Phone Number: {alert_request.phone_number}")
+        logger.info(f"Message: {alert_request.message}")
+        
+        # Validate phone number format
+        phone = alert_request.phone_number.strip()
+        twilio_service = get_twilio_service()
+        
+        if not twilio_service.validate_phone_number(phone):
+            raise HTTPException(status_code=400, detail="Phone number must be in E.164 format (start with +)")
+        
+        # Generate TwiML for alert using service
+        twiml = twilio_service.generate_alert_twiml(alert_request.message)
+        
+        # Build callback URL
+        base_url = str(request.base_url).rstrip('/')
+        
+        # Initiate call using service
+        call_result = twilio_service.initiate_call(
+            to_number=phone,
+            twiml=twiml,
+            status_callback_url=f"{base_url}/webhooks/twilio/call-status"
+        )
+        
+        logger.info(f"Alert call initiated - SID: {call_result['call_sid']}, Status: {call_result['status']}")
+        logger.info(f"=== END ALERT CALL REQUEST ===\n")
+        
+        return CallResponse(
+            success=True,
+            call_sid=call_result['call_sid'],
+            phone_number=phone,
+            status=call_result['status'],
+            message="Alert call initiated successfully"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error initiating alert call: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to initiate alert call: {str(e)}")
+
+@app.get("/call/status/{call_sid}")
+async def get_call_status_endpoint(call_sid: str):
+    """
+    Get the status of a specific call
+    
+    Args:
+        call_sid: Twilio call SID
+        
+    Returns:
+        Call status information
+    """
+    try:
+        twilio_service = get_twilio_service()
+        status = twilio_service.get_call_status(call_sid)
+        return status
+        
+    except Exception as e:
+        logger.error(f"Error fetching call status: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch call status: {str(e)}")
+
+@app.get("/webhooks/twilio/call-status")
+@app.post("/webhooks/twilio/call-status")
+async def twilio_call_status_callback(request: Request):
+    """
+    Webhook to receive call status updates from Twilio
+    Accepts both GET and POST requests as Twilio sends both.
+    
+    Args:
+        request: Request containing Twilio callback data
+        
+    Returns:
+        Success acknowledgment
+    """
+    try:
+        # Twilio sends GET requests by default, but can also send POST
+        if request.method == "GET":
+            # Extract from query parameters
+            call_sid = request.query_params.get('CallSid')
+            call_status = request.query_params.get('CallStatus')
+            from_number = request.query_params.get('From')
+            to_number = request.query_params.get('To')
+            duration = request.query_params.get('CallDuration')
+        else:
+            # Extract from form data (POST)
+            form_data = await request.form()
+            call_sid = form_data.get('CallSid')
+            call_status = form_data.get('CallStatus')
+            from_number = form_data.get('From')
+            to_number = form_data.get('To')
+            duration = form_data.get('CallDuration')
+        
+        logger.info(f"\n=== TWILIO CALL STATUS UPDATE ({request.method}) ===")
+        logger.info(f"Call SID: {call_sid}")
+        logger.info(f"Status: {call_status}")
+        logger.info(f"From: {from_number}")
+        logger.info(f"To: {to_number}")
+        logger.info(f"Duration: {duration} seconds")
+        logger.info(f"=== END STATUS UPDATE ===\n")
+        
+        # Optional: Publish to Pub/Sub or store in database
+        try:
+            status_data = {
+                'call_sid': call_sid,
+                'status': call_status,
+                'from': from_number,
+                'to': to_number,
+                'duration': duration,
+                'timestamp': datetime.now().isoformat()
+            }
+            # Could publish to Pub/Sub here if needed
+            # add_job_to_queue(status_data)
+        except Exception as e:
+            logger.warning(f"Could not publish status update: {e}")
+        
+        return {"success": True}
+        
+    except Exception as e:
+        logger.error(f"Error processing Twilio callback: {e}")
+        return {"success": False, "error": str(e)}
+
+# WebSocket endpoint for Twilio Media Streams with OpenAI Real-time API
+
+@app.websocket("/ws/twilio-stream/{context_id:path}")
+async def twilio_media_stream(websocket: WebSocket, context_id: str = None):
+    """
+    WebSocket endpoint for Twilio Media Streams
+    Handles bidirectional audio streaming with OpenAI Real-time API and Pinecone RAG
+    """
+    await websocket.accept()
+    
+    logger.info("=" * 80)
+    logger.info("🔵 TWILIO WEBSOCKET CONNECTION ACCEPTED")
+    logger.info("=" * 80)
+    
+    # Context ID comes from path parameter now
+    # Check if it's a namespace path (starts with "namespace/")
+    namespace = None
+    if context_id and context_id.startswith("namespace/"):
+        namespace = context_id.replace("namespace/", "")
+        context_id = None
+    
+    logger.info(f"📋 Configuration:")
+    logger.info(f"   - Namespace: {namespace or 'None (using direct context)'}")
+    logger.info(f"   - Context ID: {context_id or 'None'}")
+    
+    # Retrieve context_text and initial_message if context_id is provided
+    direct_context = None
+    initial_greeting = None
+    if context_id and 'context_store' in globals():
+        stored_data = globals()['context_store'].get(context_id)
+        if stored_data:
+            if isinstance(stored_data, dict):
+                direct_context = stored_data.get('context')
+                initial_greeting = stored_data.get('initial_message')
+            else:
+                # Fallback for old format (just string)
+                direct_context = stored_data
+        logger.info(f"   - Direct context loaded: {len(direct_context) if direct_context else 0} characters")
+        logger.info(f"   - Initial greeting: {initial_greeting if initial_greeting else 'None (will use default)'}")
+    
+    # Connection state
+    openai_ws = None
+    stream_sid = None
+    call_sid = None
+    connection_start_time = datetime.now()
+    
+    try:
+        # Get services
+        openai_service = get_openai_service()
+        rag_service = get_rag_service() if namespace else None
+        
+        # Build instructions based on mode
+        if direct_context:
+            # Build greeting instruction
+            greeting_instruction = ""
+            if initial_greeting:
+                greeting_instruction = f"""
+INITIAL GREETING:
+When the conversation starts, begin by saying: "{initial_greeting}"
+This should be your FIRST message to introduce the conversation.
+"""
+            
+            instructions = f"""You are a friendly conversational AI assistant. You help users understand and explore their data by having natural conversations.
+
+IMPORTANT INSTRUCTIONS:
+1. Be conversational and friendly in your responses
+2. When you receive data analysis from the system, present it naturally in your own words
+3. Ask clarifying questions if the user's request is unclear
+4. Keep responses concise for voice conversation (2-4 sentences typically)
+5. If you get data from the system, always relay it to the user clearly
+{greeting_instruction}
+The system will provide you with accurate data analysis based on the user's questions. Your job is to present this information conversationally and help the user explore the data naturally.
+"""
+        else:
+            instructions = """You are a helpful AI assistant with access to a knowledge base.
+
+IMPORTANT INSTRUCTIONS:
+1. Answer questions using the context that will be provided from the knowledge base.
+2. Be accurate, clear, and concise in your responses.
+3. If the provided context doesn't contain the answer, say so honestly.
+4. Do not make up information or provide answers that are not supported by the provided context.
+5. You can have a natural conversation while staying within the bounds of the provided information.
+"""
+        
+        # Configure and connect to OpenAI Real-time API using service
+        # Note: Twilio uses g711_ulaw format which is native for phone calls
+        # We use LangChain for intelligent question answering instead of function tools
+        
+        session_config = {
+            "type": "session.update",
+            "session": {
+                "modalities": ["text", "audio"],
+                "instructions": instructions,
+                "voice": "alloy",
+                "input_audio_format": "g711_ulaw",  # Twilio's native format
+                "output_audio_format": "g711_ulaw", # Twilio's native format
+                "input_audio_transcription": {
+                    "model": "whisper-1"
+                },
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.5,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 500
+                },
+                "temperature": 0.7,
+                "max_response_output_tokens": 4096
+            }
+        }
+        
+        if direct_context:
+            logger.info(f"   - LangChain QA enabled for context-based answering")
+        
+        openai_ws = await openai_service.connect_realtime_api(session_config)
+        logger.info("✅ OpenAI Realtime API session configured successfully")
+        
+        # Task for receiving from Twilio and sending to OpenAI
+        async def twilio_to_openai():
+            nonlocal stream_sid, call_sid
+            message_count = 0
+            try:
+                logger.info("🔄 Starting twilio_to_openai task...")
+                async for message in websocket.iter_text():
+                    message_count += 1
+                    data = json.loads(message)
+                    event_type = data.get('event')
+                    
+                    if event_type == 'start':
+                        stream_sid = data['start']['streamSid']
+                        call_sid = data['start']['callSid']
+                        logger.info("=" * 80)
+                        logger.info(f"🟢 STREAM STARTED")
+                        logger.info(f"   - StreamSID: {stream_sid}")
+                        logger.info(f"   - CallSID: {call_sid}")
+                        logger.info(f"   - Message count: {message_count}")
+                        logger.info("=" * 80)
+                        
+                        # Trigger initial greeting if provided
+                        if initial_greeting:
+                            logger.info(f"📢 Triggering initial greeting: {initial_greeting}")
+                            # Send a response.create event to trigger the AI to speak
+                            greeting_trigger = {
+                                "type": "response.create",
+                                "response": {
+                                    "modalities": ["audio", "text"],
+                                    "instructions": f"Say this greeting to start the conversation: {initial_greeting}"
+                                }
+                            }
+                            await openai_ws.send(json.dumps(greeting_trigger))
+                            logger.info("✅ Initial greeting triggered")
+                        
+                    elif event_type == 'media':
+                        # Forward audio to OpenAI using service
+                        media_payload = data['media']['payload']
+                        await openai_service.send_audio_to_realtime(openai_ws, media_payload)
+                        if message_count % 100 == 0:  # Log every 100 media messages
+                            logger.info(f"📡 Audio streaming active - {message_count} messages processed")
+                        
+                    elif event_type == 'stop':
+                        duration = (datetime.now() - connection_start_time).total_seconds()
+                        logger.info("=" * 80)
+                        logger.info(f"🔴 STREAM STOPPED (Twilio sent stop event)")
+                        logger.info(f"   - StreamSID: {stream_sid}")
+                        logger.info(f"   - CallSID: {call_sid}")
+                        logger.info(f"   - Duration: {duration:.2f} seconds")
+                        logger.info(f"   - Total messages: {message_count}")
+                        logger.info(f"   - Reason: Twilio sent 'stop' event (call ended by user or system)")
+                        logger.info("=" * 80)
+                        break
+                        
+            except WebSocketDisconnect as e:
+                duration = (datetime.now() - connection_start_time).total_seconds()
+                logger.warning("=" * 80)
+                logger.warning(f"⚠️ TWILIO WEBSOCKET DISCONNECTED")
+                logger.warning(f"   - StreamSID: {stream_sid}")
+                logger.warning(f"   - CallSID: {call_sid}")
+                logger.warning(f"   - Duration: {duration:.2f} seconds")
+                logger.warning(f"   - Messages processed: {message_count}")
+                logger.warning(f"   - Reason: {str(e)}")
+                logger.warning("=" * 80)
+            except Exception as e:
+                duration = (datetime.now() - connection_start_time).total_seconds()
+                logger.error("=" * 80)
+                logger.error(f"❌ ERROR in twilio_to_openai")
+                logger.error(f"   - StreamSID: {stream_sid}")
+                logger.error(f"   - CallSID: {call_sid}")
+                logger.error(f"   - Duration: {duration:.2f} seconds")
+                logger.error(f"   - Messages processed: {message_count}")
+                logger.error(f"   - Error: {str(e)}")
+                logger.error("=" * 80)
+                import traceback
+                logger.error(traceback.format_exc())
+        
+        # Task for receiving from OpenAI and sending to Twilio
+        async def openai_to_twilio():
+            openai_message_count = 0
+            transcript_count = 0
+            audio_chunk_count = 0
+            try:
+                logger.info("🔄 Starting openai_to_twilio task...")
+                last_transcript = ""
+                
+                async for message in openai_ws:
+                    openai_message_count += 1
+                    data = json.loads(message)
+                    event_type = data.get('type')
+                    
+                    # Handle audio responses from OpenAI
+                    if event_type == 'response.audio.delta':
+                        audio_delta = data.get('delta')
+                        if audio_delta:
+                            audio_chunk_count += 1
+                            # Send audio to Twilio
+                            media_message = {
+                                "event": "media",
+                                "streamSid": stream_sid,
+                                "media": {
+                                    "payload": audio_delta
+                                }
+                            }
+                            await websocket.send_json(media_message)
+                            if audio_chunk_count % 50 == 0:  # Log every 50 audio chunks
+                                logger.info(f"🔊 AI speaking - {audio_chunk_count} audio chunks sent")
+                    
+                    # Handle transcripts for RAG queries
+                    elif event_type == 'conversation.item.input_audio_transcription.completed':
+                        transcript = data.get('transcript', '')
+                        if transcript and transcript != last_transcript:
+                            last_transcript = transcript
+                            transcript_count += 1
+                            logger.info("=" * 80)
+                            logger.info(f"🗣️ USER SPEECH TRANSCRIBED (#{transcript_count})")
+                            logger.info(f"   - Transcript: \"{transcript}\"")
+                            logger.info(f"   - Length: {len(transcript)} characters")
+                            logger.info("=" * 80)
+                            
+                            # Only query Pinecone if namespace is provided (not using direct context)
+                            if namespace and rag_service:
+                                try:
+                                    logger.info(f"🔍 Querying Pinecone namespace '{namespace}'...")
+                                    context = await rag_service.query_context(
+                                        query_text=transcript,
+                                        namespace=namespace,
+                                        top_k=5
+                                    )
+                                    logger.info(f"✅ Retrieved context from Pinecone (length: {len(context)} characters)")
+                                    
+                                    # Inject context into conversation using service
+                                    if context and "No relevant context" not in context:
+                                        await openai_service.inject_context_to_conversation(openai_ws, context)
+                                        logger.info(f"✅ Context injected into conversation")
+                                    else:
+                                        logger.warning(f"⚠️ No relevant context found in Pinecone")
+                                        
+                                except Exception as e:
+                                    logger.error(f"❌ Error querying Pinecone: {e}")
+                                    import traceback
+                                    logger.error(traceback.format_exc())
+                            elif direct_context:
+                                # Use LangChain to intelligently answer from direct context
+                                try:
+                                    logger.info(f"🤖 Using LangChain to answer from direct context...")
+                                    langchain_service = get_langchain_service()
+                                    
+                                    # Get intelligent answer from LangChain
+                                    answer = await langchain_service.answer_question(transcript, direct_context)
+                                    
+                                    logger.info(f"✅ LangChain answer: {answer[:200]}...")
+                                    
+                                    # Inject the answer into the conversation
+                                    context_message = {
+                                        "type": "conversation.item.create",
+                                        "item": {
+                                            "type": "message",
+                                            "role": "system",
+                                            "content": [
+                                                {
+                                                    "type": "input_text",
+                                                    "text": f"Based on the data analysis: {answer}"
+                                                }
+                                            ]
+                                        }
+                                    }
+                                    await openai_ws.send(json.dumps(context_message))
+                                    
+                                    # Trigger response
+                                    response_create = {
+                                        "type": "response.create"
+                                    }
+                                    await openai_ws.send(json.dumps(response_create))
+                                    logger.info(f"✅ LangChain answer injected, response triggered")
+                                    
+                                except Exception as e:
+                                    logger.error(f"❌ Error in LangChain processing: {e}")
+                                    logger.error(traceback.format_exc())
+                    
+                    # Handle response completion
+                    elif event_type == 'response.done':
+                        logger.info(f"✅ AI response completed (Total OpenAI messages: {openai_message_count})")
+                    
+                    # Handle errors
+                    elif event_type == 'error':
+                        error_info = data.get('error', {})
+                        logger.error("=" * 80)
+                        logger.error(f"❌ OPENAI ERROR")
+                        logger.error(f"   - Error: {error_info}")
+                        logger.error(f"   - Message count: {openai_message_count}")
+                        logger.error("=" * 80)
+                        
+            except Exception as e:
+                duration = (datetime.now() - connection_start_time).total_seconds()
+                logger.error("=" * 80)
+                logger.error(f"❌ ERROR in openai_to_twilio")
+                logger.error(f"   - Duration: {duration:.2f} seconds")
+                logger.error(f"   - OpenAI messages: {openai_message_count}")
+                logger.error(f"   - Transcripts: {transcript_count}")
+                logger.error(f"   - Audio chunks: {audio_chunk_count}")
+                logger.error(f"   - Error: {str(e)}")
+                logger.error("=" * 80)
+                import traceback
+                logger.error(traceback.format_exc())
+        
+        # Run both tasks concurrently
+        logger.info("🚀 Starting concurrent tasks (twilio_to_openai & openai_to_twilio)...")
+        await asyncio.gather(
+            twilio_to_openai(),
+            openai_to_twilio()
+        )
+        logger.info("✅ Both tasks completed")
+        
+    except Exception as e:
+        duration = (datetime.now() - connection_start_time).total_seconds()
+        logger.error("=" * 80)
+        logger.error(f"❌ WEBSOCKET ERROR")
+        logger.error(f"   - CallSID: {call_sid}")
+        logger.error(f"   - Duration: {duration:.2f} seconds")
+        logger.error(f"   - Error: {str(e)}")
+        logger.error("=" * 80)
+        import traceback
+        logger.error(traceback.format_exc())
+    finally:
+        # Clean up
+        duration = (datetime.now() - connection_start_time).total_seconds()
+        logger.info("=" * 80)
+        logger.info(f"🔵 WEBSOCKET SESSION CLEANUP")
+        logger.info(f"   - CallSID: {call_sid}")
+        logger.info(f"   - StreamSID: {stream_sid}")
+        logger.info(f"   - Total duration: {duration:.2f} seconds")
+        logger.info("=" * 80)
+        
+        if openai_ws:
+            try:
+                await openai_ws.close()
+                logger.info("✅ OpenAI WebSocket closed")
+            except Exception as e:
+                logger.warning(f"⚠️ Error closing OpenAI WebSocket: {e}")
+        
+        try:
+            await websocket.close()
+            logger.info("✅ Twilio WebSocket closed")
+        except Exception as e:
+            logger.warning(f"⚠️ Error closing Twilio WebSocket: {e}")
+        
+        logger.info("=" * 80)
+        logger.info(f"🔵 WEBSOCKET SESSION ENDED")
+        logger.info(f"   - CallSID: {call_sid}")
+        logger.info(f"   - Total duration: {duration:.2f} seconds")
+        logger.info("=" * 80)
+
+@app.websocket("/ws/test-conversation")
+async def test_conversation(websocket: WebSocket):
+    """
+    WebSocket endpoint for testing conversational AI without making actual phone calls.
+    This simulates the same flow as Twilio but uses browser audio instead.
+    """
+    await websocket.accept()
+    
+    logger.info("Test conversation WebSocket connection accepted")
+    
+    # Extract parameters from query
+    namespace = websocket.query_params.get('namespace', 'test')
+    voice = websocket.query_params.get('voice', 'alloy')
+    logger.info(f"Test conversation - Namespace: {namespace}, Voice: {voice}")
+    
+    # Connection state
+    openai_ws = None
+    
+    try:
+        # Get services
+        openai_service = get_openai_service()
+        rag_service = get_rag_service()
+        
+        # Send initial status
+        await websocket.send_json({
+            'type': 'status',
+            'message': f'Connecting to OpenAI Realtime API with voice: {voice}'
+        })
+        
+        # Configure and connect to OpenAI Real-time API
+        session_config = openai_service.get_default_session_config(
+            instructions=f"You are a helpful AI assistant. Use the provided context from the knowledge base (namespace: {namespace}) to answer questions accurately. If you don't find relevant information in the context, say so honestly.",
+            voice=voice,
+            temperature=0.7
+        )
+        
+        openai_ws = await openai_service.connect_realtime_api(session_config)
+        logger.info("Test conversation: OpenAI session configured")
+        
+        await websocket.send_json({
+            'type': 'status',
+            'message': '✓ Connected to OpenAI Realtime API'
+        })
+        
+        # Task for receiving from browser and sending to OpenAI
+        async def browser_to_openai():
+            try:
+                logger.info("Test conversation: browser_to_openai task started")
+                async for message in websocket.iter_text():
+                    data = json.loads(message)
+                    message_type = data.get('type')
+                    
+                    if message_type == 'audio':
+                        # Forward audio to OpenAI
+                        audio_data = data.get('audio', '')
+                        if audio_data:
+                            await openai_service.send_audio_to_realtime(openai_ws, audio_data)
+                    
+                    elif message_type == 'stop':
+                        logger.info("Test conversation: Stop requested")
+                        break
+                        
+            except WebSocketDisconnect:
+                logger.info("Test conversation: Browser WebSocket disconnected")
+            except Exception as e:
+                logger.error(f"Error in browser_to_openai: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        
+        # Task for receiving from OpenAI and sending to browser
+        async def openai_to_browser():
+            try:
+                logger.info("Test conversation: openai_to_browser task started")
+                last_transcript = ""
+                
+                async for message in openai_ws:
+                    data = json.loads(message)
+                    event_type = data.get('type')
+                    
+                    # Handle audio responses from OpenAI
+                    if event_type == 'response.audio.delta':
+                        audio_delta = data.get('delta')
+                        if audio_delta:
+                            # Send audio to browser
+                            await websocket.send_json({
+                                'type': 'audio',
+                                'audio_delta': audio_delta
+                            })
+                    
+                    # Handle transcripts for RAG queries
+                    elif event_type == 'conversation.item.input_audio_transcription.completed':
+                        transcript = data.get('transcript', '')
+                        if transcript and transcript != last_transcript:
+                            last_transcript = transcript
+                            logger.info(f"Test conversation - User said: {transcript}")
+                            
+                            # Send transcript to browser
+                            await websocket.send_json({
+                                'type': 'transcript',
+                                'text': transcript
+                            })
+                            
+                            # Query Pinecone for context
+                            try:
+                                await websocket.send_json({
+                                    'type': 'rag_query',
+                                    'query': transcript
+                                })
+                                
+                                context = await rag_service.query_context(
+                                    query_text=transcript,
+                                    namespace=namespace,
+                                    top_k=5
+                                )
+                                logger.info(f"Test conversation - Retrieved context (length: {len(context)})")
+                                
+                                # Count chunks
+                                chunk_count = context.count('[Result') if context else 0
+                                await websocket.send_json({
+                                    'type': 'rag_result',
+                                    'chunks': chunk_count,
+                                    'context_length': len(context)
+                                })
+                                
+                                # Inject context into conversation
+                                if context and "No relevant context" not in context:
+                                    await openai_service.inject_context_to_conversation(openai_ws, context)
+                                    
+                            except Exception as e:
+                                logger.error(f"Test conversation - Error querying Pinecone: {e}")
+                                await websocket.send_json({
+                                    'type': 'error',
+                                    'error': f'RAG query failed: {str(e)}'
+                                })
+                    
+                    # Handle response completion
+                    elif event_type == 'response.done':
+                        logger.info("Test conversation: Response completed")
+                        await websocket.send_json({
+                            'type': 'response_done'
+                        })
+                    
+                    # Handle errors
+                    elif event_type == 'error':
+                        error_info = data.get('error', {})
+                        logger.error(f"Test conversation - OpenAI error: {error_info}")
+                        await websocket.send_json({
+                            'type': 'error',
+                            'error': str(error_info)
+                        })
+                        
+            except Exception as e:
+                logger.error(f"Error in openai_to_browser: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                try:
+                    await websocket.send_json({
+                        'type': 'error',
+                        'error': str(e)
+                    })
+                except:
+                    pass
+        
+        # Run both tasks concurrently
+        logger.info("Test conversation: Starting concurrent tasks")
+        try:
+            await asyncio.gather(
+                browser_to_openai(),
+                openai_to_browser(),
+                return_exceptions=True
+            )
+        except Exception as e:
+            logger.error(f"Error in gather: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+        
+    except Exception as e:
+        logger.error(f"Test conversation WebSocket error: {e}")
+        try:
+            await websocket.send_json({
+                'type': 'error',
+                'error': str(e)
+            })
+        except:
+            pass
+    finally:
+        # Clean up
+        if openai_ws:
+            await openai_ws.close()
+            logger.info("Test conversation: OpenAI WebSocket closed")
+        
+        try:
+            await websocket.close()
+            logger.info("Test conversation: Browser WebSocket closed")
+        except:
+            pass
+        
+        logger.info(f"Test conversation session ended")
+
+# Exception handlers
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=ApiError(error=exc.detail).dict()
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content=ApiError(
+            error="Internal server error",
+            details=str(exc)
+        ).dict()
+    )
+
+# def process_batch_workflow(client, gcs_client, jobs_batch: List[Dict[str, Any]]) -> bool:
+    """
+    Process a batch of jobs together:
+    1. Copy all files to dev/unstructured.io/
+    2. Trigger workflow once for all files
+    """
+    global current_job_id, current_job_lock
+    
+    try:
+        logger.info(f"=== Processing Batch of {len(jobs_batch)} Jobs ===")
+        
+        # Get workflow and namespace from first job (assuming all use same workflow)
+        first_job = jobs_batch[0]
+        workflow_id = first_job['workflow_id']
+        namespace = first_job.get('namespace')
+        bucket_name = first_job.get('bucket')
+        
+        # Get Pinecone connector if namespace provided
+        pinecone_connector_id = None
+        if namespace:
+            try:
+                pinecone_connectors = get_pinecone_connectors(client)
+                if pinecone_connectors:
+                    pinecone_connector_id = pinecone_connectors[0].id
+                    logger.info(f"Using Pinecone connector: {pinecone_connector_id}")
+            except Exception as e:
+                logger.warning(f"Could not get Pinecone connector: {e}")
+        
+        # Copy all files to dev/unstructured.io/
+        logger.info(f"Copying {len(jobs_batch)} files to dev/unstructured.io/")
+        copied_files = []
+        failed_files = []
+        
+        for job_data in jobs_batch:
+            filename = job_data['filename']
+            source_path = job_data['gcs_path']
+            target_path = f"dev/unstructured.io/{filename}"
+            
+            logger.info(f"  Copying: {filename}")
+            copy_result = copy_file_in_gcs(gcs_client, bucket_name, source_path, target_path)
+            
+            if copy_result.get('success'):
+                copied_files.append(filename)
+                logger.info(f"  ✅ Copied: {filename}")
+            else:
+                failed_files.append(filename)
+                logger.error(f"  ❌ Failed to copy: {filename}")
+        
+        if not copied_files:
+            logger.error("No files were copied successfully")
+            return False
+        
+        logger.info(f"✅ Successfully copied {len(copied_files)}/{len(jobs_batch)} files")
+        if failed_files:
+            logger.warning(f"⚠️ Failed to copy {len(failed_files)} files: {failed_files}")
+        
+        # Trigger workflow once for all files in dev/unstructured.io/
+        logger.info(f"Triggering workflow for {len(copied_files)} files in dev/unstructured.io/")
+        workflow_result = trigger_workflow(
+            client,
+            workflow_id,
+            namespace=namespace,
+            pinecone_connector_id=pinecone_connector_id
+        )
+        
+        if not workflow_result.get('success'):
+            logger.error("Workflow trigger failed")
+            return False
+        
+        # Track the job ID
+        job_id = workflow_result.get('job_id')
+        if job_id:
+            with current_job_lock:
+                current_job_id = job_id
+            logger.info(f"✅ Workflow triggered with job_id: {job_id}")
+        else:
+            logger.info("✅ Workflow triggered successfully")
+        
+        logger.info(f"=== Batch Processing Completed: {len(copied_files)} files ===")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error in batch workflow processing: {e}")
+        logger.error(traceback.format_exc())
+        return False
+
+def process_batch_workflow(client, gcs_client, jobs_batch: List[Dict[str, Any]]) -> bool:
+    """
+    Process a batch of jobs, grouping by namespace:
+    1. Group jobs by namespace
+    2. For each namespace group:
+       - Copy files to dev/unstructured.io/
+       - Update Pinecone connector with namespace
+       - Trigger workflow for those files
+    3. Process all namespace groups sequentially
+    """
+    global current_job_id, current_job_lock
+    
+    
+    try:
+        logger.info(f"=== Processing Batch of {len(jobs_batch)} Jobs ===")
+        
+        # Group jobs by namespace
+        jobs_by_namespace = {}
+        for job_data in jobs_batch:
+            namespace = job_data.get('namespace') or 'default'  # Use 'default' for None
+            if namespace not in jobs_by_namespace:
+                jobs_by_namespace[namespace] = []
+            jobs_by_namespace[namespace].append(job_data)
+        
+        logger.info(f"📊 Jobs grouped into {len(jobs_by_namespace)} namespace(s): {list(jobs_by_namespace.keys())}")
+        
+        # Get Pinecone connector (same for all namespaces)
+        pinecone_connector_id = None
+        try:
+            pinecone_connectors = get_pinecone_connectors(client)
+            if pinecone_connectors:
+                pinecone_connector_id = pinecone_connectors[0].id
+                logger.info(f"Using Pinecone connector: {pinecone_connector_id}")
+        except Exception as e:
+            logger.warning(f"Could not get Pinecone connector: {e}")
+        
+        # Get workflow_id from first job (assuming all use same workflow)
+        workflow_id = jobs_batch[0]['workflow_id']
+        bucket_name = jobs_batch[0].get('bucket')
+        
+        overall_success = True
+        total_processed = 0
+        
+        # Process each namespace group separately
+        for namespace, namespace_jobs in jobs_by_namespace.items():
+            logger.info(f"\n{'='*60}")
+            logger.info(f"📦 Processing {len(namespace_jobs)} jobs for namespace: '{namespace}'")
+            logger.info(f"{'='*60}")
+            
+            # Copy files for this namespace to dev/unstructured.io/
+            logger.info(f"Copying {len(namespace_jobs)} files to dev/unstructured.io/")
+            copied_files = []
+            failed_files = []
+            
+            for job_data in namespace_jobs:
+                filename = job_data['filename']
+                source_path = job_data['gcs_path']
+                target_path = f"dev/unstructured.io/{filename}"
+                
+                logger.info(f"  Copying: {filename} (namespace: '{namespace}')")
+                copy_result = copy_file_in_gcs(gcs_client, bucket_name, source_path, target_path)
+                
+                if copy_result.get('success'):
+                    copied_files.append(filename)
+                    logger.info(f"  ✅ Copied: {filename}")
+                else:
+                    failed_files.append(filename)
+                    logger.error(f"  ❌ Failed to copy: {filename}")
+            
+            if not copied_files:
+                logger.error(f"No files were copied successfully for namespace '{namespace}'")
+                overall_success = False
+                continue
+            
+            logger.info(f"✅ Successfully copied {len(copied_files)}/{len(namespace_jobs)} files for namespace '{namespace}'")
+            if failed_files:
+                logger.warning(f"⚠️ Failed to copy {len(failed_files)} files: {failed_files}")
+            
+            # Update namespace if provided (skip if 'default' and no namespace was originally set)
+            actual_namespace = None if namespace == 'default' and not any(j.get('namespace') for j in namespace_jobs) else namespace
+            
+            # Trigger workflow for this namespace group
+            logger.info(f"Triggering workflow for {len(copied_files)} files in namespace '{actual_namespace or 'default'}'")
+            workflow_result = trigger_workflow(
+                client,
+                workflow_id,
+                namespace=actual_namespace if actual_namespace != 'default' else None,
+                pinecone_connector_id=pinecone_connector_id
+            )
+            
+            if not workflow_result.get('success'):
+                logger.error(f"Workflow trigger failed for namespace '{actual_namespace or 'default'}'")
+                overall_success = False
+                continue
+            
+            # Track the job ID
+            job_id = workflow_result.get('job_id')
+            if job_id:
+                with current_job_lock:
+                    current_job_id = job_id
+                logger.info(f"✅ Workflow triggered with job_id: {job_id} for namespace '{actual_namespace or 'default'}'")
+            else:
+                logger.info(f"✅ Workflow triggered successfully for namespace '{actual_namespace or 'default'}'")
+            
+            total_processed += len(copied_files)
+            
+            # Wait for workflow to complete before processing next namespace
+            logger.info(f"Waiting for workflow to complete before processing next namespace...")
+            if is_job_running(client):
+                wait_for_current_workflow(client)
+                logger.info(f"✅ Workflow completed for namespace '{actual_namespace or 'default'}'")
+        
+        logger.info(f"\n{'='*60}")
+        logger.info(f"=== Batch Processing Completed: {total_processed} files across {len(jobs_by_namespace)} namespace(s) ===")
+        logger.info(f"{'='*60}\n")
+        
+        return overall_success
+        
+    except Exception as e:
+        logger.error(f"Error in batch workflow processing: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
+
+def pubsub_consumer():
+    """Pub/Sub consumer that processes jobs in batches after workflow completes"""
+    logger.info("Starting Pub/Sub batch consumer...")
+    
+    while True:
+        try:
+            # Get subscriber client
+            if PUBSUB_CREDENTIALS_BASE64:
+                credentials_json = base64.b64decode(PUBSUB_CREDENTIALS_BASE64).decode('utf-8')
+                credentials_info = json.loads(credentials_json)
+                credentials = service_account.Credentials.from_service_account_info(credentials_info)
+                subscriber = pubsub_v1.SubscriberClient(credentials=credentials)
+            elif PUBSUB_CREDENTIALS_PATH and os.path.exists(PUBSUB_CREDENTIALS_PATH):
+                credentials = service_account.Credentials.from_service_account_file(PUBSUB_CREDENTIALS_PATH)
+                subscriber = pubsub_v1.SubscriberClient(credentials=credentials)
+            else:
+                subscriber = pubsub_v1.SubscriberClient()
+            
+            subscription_path = subscriber.subscription_path(PUBSUB_PROJECT_ID, PUBSUB_SUBSCRIPTION)
+            logger.info(f"Pub/Sub batch consumer listening on: {subscription_path}")
+            
+            # Get clients
+            client = get_unstructured_client()
+            gcs_client = get_gcs_client()
+            
+            if not client or not gcs_client:
+                logger.error("Failed to initialize clients")
+                time.sleep(10)
+                continue
+            
+            while True:
+                # Wait for any currently running workflow to finish
+                if is_job_running(client):
+                    logger.info("Workflow is currently running, waiting for completion...")
+                    wait_for_current_workflow(client)
+                    logger.info("✅ Workflow completed, ready to process queued jobs")
+                
+                # Pull all available messages from the queue
+                logger.info("Pulling all messages from queue...")
+                
+                try:
+                    # Pull up to 100 messages at once
+                    response = subscriber.pull(
+                        request={
+                            "subscription": subscription_path,
+                            "max_messages": 100,
+                        },
+                        timeout=5.0
+                    )
+                    
+                    if not response.received_messages:
+                        logger.info("No messages in queue, waiting...")
+                        time.sleep(10)
+                        continue
+                    
+                    # Collect all job data
+                    jobs_batch = []
+                    ack_ids = []
+                    
+                    for received_message in response.received_messages:
+                        try:
+                            job_data = json.loads(received_message.message.data.decode('utf-8'))
+                            jobs_batch.append(job_data)
+                            ack_ids.append(received_message.ack_id)
+                            logger.info(f"  Queued: {job_data['filename']}")
+                        except Exception as e:
+                            logger.error(f"Error parsing message: {e}")
+                    
+                    if not jobs_batch:
+                        logger.warning("No valid messages in batch")
+                        time.sleep(5)
+                        continue
+                    
+                    logger.info(f"📦 Pulled {len(jobs_batch)} jobs from queue")
+                    
+                    # Process all jobs together
+                    if process_batch_workflow(client, gcs_client, jobs_batch):
+                        # ACK all messages on success
+                        subscriber.acknowledge(
+                            request={
+                                "subscription": subscription_path,
+                                "ack_ids": ack_ids
+                            }
+                        )
+                        logger.info(f"✅ Acknowledged {len(ack_ids)} messages")
+                        
+                        # Wait before checking queue again
+                        logger.info("Waiting 30 seconds before next batch...")
+                        time.sleep(30)
+                    else:
+                        # On failure, messages will be redelivered automatically
+                        logger.error(f"❌ Batch processing failed, messages will be redelivered")
+                        time.sleep(10)
+                        
+                except Exception as e:
+                    if "Deadline" in str(e) or "timeout" in str(e).lower():
+                        # Timeout is expected when queue is empty
+                        logger.debug("Pull timeout (queue empty)")
+                        time.sleep(5)
+                    else:
+                        logger.error(f"Error pulling messages: {e}")
+                        time.sleep(10)
+                
+        except Exception as e:
+            logger.error(f"Pub/Sub consumer error: {e}, retrying in 10 seconds...")
+            logger.error(traceback.format_exc())
+            time.sleep(10)
+
+@app.on_event("startup")
+async def startup_event():
+    """Log startup information and start Pub/Sub consumer"""
+    port = int(os.getenv("PORT", 8000))
+    environment = "Cloud Run" if os.getenv("K_SERVICE") else "Local"
+    logger.info("=" * 80)
+    logger.info("🚀 APPLICATION STARTUP")
+    logger.info(f"   - Environment: {environment}")
+    logger.info(f"   - Port: {port}")
+    logger.info(f"   - WebSocket support: Enabled")
+    logger.info(f"   - Pub/Sub configured: {bool(PUBSUB_PROJECT_ID and PUBSUB_TOPIC)}")
+    if os.getenv("K_SERVICE"):
+        logger.info(f"   - Cloud Run Service: {os.getenv('K_SERVICE')}")
+        logger.info(f"   - Cloud Run Revision: {os.getenv('K_REVISION')}")
+    logger.info("=" * 80)
+    
+    # Start Pub/Sub consumer in background thread
+    if PUBSUB_PROJECT_ID and PUBSUB_TOPIC:
+        try:
+            consumer_thread = threading.Thread(target=pubsub_consumer, daemon=True)
+            consumer_thread.start()
+            logger.info("✅ Pub/Sub consumer thread started")
+        except Exception as e:
+            logger.error(f"Failed to start Pub/Sub consumer: {e}")
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    logger.info(f"Starting server on 0.0.0.0:{port}")
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        timeout_keep_alive=3600,
+        ws_ping_interval=20,
+        ws_ping_timeout=20,
+        log_level="info"
+    )

@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv
+
+.env
+.DS_Store
+thoreon-research-ai-d7211146e677.json
+thoreon-research-ai-dc59b6acbb13.json
