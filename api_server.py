@@ -21,7 +21,7 @@ from google.oauth2 import service_account
 from unstructured_client import UnstructuredClient
 from unstructured_client.models.operations import (
     ListWorkflowsRequest, ListJobsRequest, RunWorkflowRequest, 
-    ListDestinationsRequest, UpdateDestinationRequest
+    ListDestinationsRequest, UpdateDestinationRequest, GetJobRequest
 )
 from unstructured_client.models.shared import UpdateDestinationConnector
 import websockets
@@ -333,6 +333,74 @@ def upload_file_to_gcs(gcs_client, bucket_name: str, file_content: bytes, filena
         logger.error(f"Error uploading to GCS: {e}")
         raise HTTPException(status_code=500, detail=f"GCS upload failed: {e}")
 
+def copy_file_in_gcs(gcs_client, bucket_name: str, source_path: str, target_path: str):
+    """Copy a file from one location to another within GCS"""
+    try:
+        logger.info(f"Copying file in GCS: {source_path} → {target_path}")
+        
+        bucket = gcs_client.bucket(bucket_name)
+        
+        # Get source blob
+        source_blob = bucket.blob(source_path)
+        
+        if not source_blob.exists():
+            logger.error(f"Source file does not exist: {source_path}")
+            return {'success': False, 'error': 'Source file not found'}
+        
+        # Copy to target location
+        target_blob = bucket.blob(target_path)
+        target_blob.rewrite(source_blob)
+        
+        # Verify copy succeeded
+        if not target_blob.exists():
+            logger.error(f"Failed to copy file to: {target_path}")
+            return {'success': False, 'error': 'Copy verification failed'}
+        
+        logger.info(f"✅ File copied successfully to: {target_path}")
+        
+        return {
+            'success': True,
+            'source_path': source_path,
+            'target_path': target_path,
+            'bucket': bucket_name
+        }
+        
+    except Exception as e:
+        logger.error(f"Error copying file in GCS: {e}")
+        return {'success': False, 'error': str(e)}
+
+def wait_for_workflow_completion(client, job_id: str, max_wait_time: int = 600, check_interval: int = 15) -> bool:
+    """Wait until a specific workflow job completes"""
+    try:
+        elapsed_time = 0
+        
+        while elapsed_time < max_wait_time:
+            try:
+                job_status = check_job_status(client, job_id)
+                if job_status and hasattr(job_status, 'status'):
+                    status = job_status.status.lower()
+                    logger.info(f"Job {job_id} status: {status}")
+                    
+                    if status in ['completed', 'failed', 'cancelled', 'finished']:
+                        logger.info(f"✅ Job {job_id} completed with status: {status}")
+                        return True
+            except Exception as e:
+                logger.error(f"Error checking job status: {e}")
+            
+            # Wait before next check
+            time.sleep(check_interval)
+            elapsed_time += check_interval
+            
+            if elapsed_time % 60 == 0:  # Log every minute
+                logger.info(f"Waiting for job {job_id} completion... ({elapsed_time}/{max_wait_time}s)")
+        
+        logger.warning(f"⏱️ Timeout waiting for job {job_id} completion ({max_wait_time}s)")
+        return False
+        
+    except Exception as e:
+        logger.error(f"Error in wait_for_workflow_completion: {e}")
+        return False
+
 def trigger_workflow(unstructured_client, workflow_id: str, namespace: Optional[str] = None, pinecone_connector_id: Optional[str] = None, retry_count: int = 0, max_retries: int = 3):
     """Manually trigger a workflow to process uploaded files with optional namespace update and rate limiting protection"""
     try:
@@ -484,6 +552,127 @@ def add_job_to_queue(job_data: Dict[str, Any]):
         logger.error(f"Failed to add job to queue: {e}")
         return False
 
+def is_job_running(client) -> bool:
+    """Check if any workflow job is currently running"""
+    global current_job_id, current_job_lock
+    
+    with current_job_lock:
+        if current_job_id:
+            try:
+                job_status = check_job_status(client, current_job_id)
+                if job_status and hasattr(job_status, 'status'):
+                    status = job_status.status.lower()
+                    if status in ['completed', 'failed', 'cancelled', 'finished']:
+                        logger.info(f"Job {current_job_id} completed with status: {status}")
+                        current_job_id = None
+                        return False
+                    return True
+            except Exception as e:
+                logger.error(f"Error checking job status: {e}")
+                current_job_id = None
+        
+        return False
+
+def wait_for_current_workflow(client, max_wait_time: int = 600, check_interval: int = 15) -> bool:
+    """Wait for any currently running workflow to finish"""
+    try:
+        elapsed_time = 0
+        
+        while elapsed_time < max_wait_time:
+            if not is_job_running(client):
+                logger.info("No workflow currently running, proceeding...")
+                return True
+            
+            logger.info(f"Workflow is running, waiting... ({elapsed_time}/{max_wait_time}s)")
+            time.sleep(check_interval)
+            elapsed_time += check_interval
+        
+        logger.warning(f"⏱️ Timeout waiting for workflow ({max_wait_time}s), proceeding anyway...")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error waiting for workflow: {e}")
+        return True
+
+def process_two_stage_workflow(client, gcs_client, job_data: Dict[str, Any]) -> bool:
+    """
+    Process a two-stage workflow:
+    1. Wait for any currently running workflow to finish
+    2. Copy file to dev/unstructured.io/
+    3. Trigger workflow for files in dev/unstructured.io/
+    """
+    global current_job_id, current_job_lock
+    
+    try:
+        logger.info(f"=== Starting Two-Stage Workflow for {job_data['filename']} ===")
+        
+        # Extract job data
+        filename = job_data['filename']
+        source_gcs_path = job_data['gcs_path']
+        bucket_name = job_data['bucket']
+        workflow_id = job_data['workflow_id']
+        namespace = job_data.get('namespace')
+        
+        # Get Pinecone connector if namespace provided
+        pinecone_connector_id = None
+        if namespace:
+            try:
+                pinecone_connectors = get_pinecone_connectors(client)
+                if pinecone_connectors:
+                    pinecone_connector_id = pinecone_connectors[0].id
+                    logger.info(f"Using Pinecone connector: {pinecone_connector_id}")
+            except Exception as e:
+                logger.warning(f"Could not get Pinecone connector: {e}")
+        
+        # Stage 1: Wait for any currently running workflow to finish
+        logger.info(f"Stage 1: Checking if any workflow is currently running...")
+        if is_job_running(client):
+            logger.info("Workflow is running, waiting for completion...")
+            wait_for_current_workflow(client)
+        else:
+            logger.info("No workflow currently running")
+        
+        # Stage 2: Copy file to dev/unstructured.io/
+        logger.info(f"Stage 2: Copying file to dev/unstructured.io/")
+        target_path = f"dev/unstructured.io/{filename}"
+        
+        copy_result = copy_file_in_gcs(gcs_client, bucket_name, source_gcs_path, target_path)
+        
+        if not copy_result.get('success'):
+            logger.error(f"Stage 2 failed: Could not copy file to {target_path}")
+            return False
+        
+        logger.info(f"✅ Stage 2: File copied to {target_path}")
+        
+        # Stage 3: Trigger workflow for dev/unstructured.io/
+        logger.info(f"Stage 3: Triggering workflow for dev/unstructured.io/")
+        workflow_result = trigger_workflow(
+            client,
+            workflow_id,
+            namespace=namespace,
+            pinecone_connector_id=pinecone_connector_id
+        )
+        
+        if not workflow_result.get('success'):
+            logger.error(f"Stage 3 failed: Workflow trigger failed")
+            return False
+        
+        # Track the job ID
+        job_id = workflow_result.get('job_id')
+        if job_id:
+            with current_job_lock:
+                current_job_id = job_id
+            logger.info(f"✅ Stage 3: Workflow triggered with job_id: {job_id}")
+        else:
+            logger.info(f"✅ Stage 3: Workflow triggered successfully")
+        
+        logger.info(f"=== Two-Stage Workflow Completed for {filename} ===")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error in two-stage workflow: {e}")
+        return False
+
 def get_destination_connectors(client):
     """Get available destination connectors"""
     try:
@@ -584,7 +773,9 @@ def update_pinecone_namespace(client, connector_id, new_namespace, connector_con
 def check_job_status(client, job_id):
     """Check the status of a workflow job"""
     try:
-        response = client.jobs.get_job(job_id)
+        response = client.jobs.get_job(
+            request=GetJobRequest(job_id=job_id)
+        )
         return response.job_information if response else None
     except Exception as e:
         logger.error(f"Error checking job status: {e}")
@@ -952,48 +1143,33 @@ async def upload_pdf(
             'uploaded_at': time.time()
         }
         
-        # Always trigger workflow directly after upload
-        logger.info(f"Triggering workflow directly for {file.filename}")
+        # Add job to Pub/Sub queue for two-stage workflow processing
+        logger.info(f"Adding {file.filename} to Pub/Sub queue for two-stage workflow")
         
-        # Get Pinecone connector ID if namespace is provided
-        pinecone_connector_id = None
-        if namespace:  # Changed: Remove the "!= default" check
-            try:
-                pinecone_connectors = get_pinecone_connectors(client)
-                if pinecone_connectors:
-                    pinecone_connector_id = pinecone_connectors[0].id
-                    logger.info(f"Using Pinecone connector: {pinecone_connector_id}")
-                    logger.info(f"Will update namespace to: {namespace}")
-                else:
-                    logger.warning("No Pinecone connectors found")
-            except Exception as e:
-                logger.warning(f"Could not get Pinecone connector: {e}")
+        queue_success = add_job_to_queue(job_data)
+        
+        if not queue_success:
+            logger.warning("Failed to add to queue, falling back to immediate processing")
+            # Fallback: trigger workflow immediately if queue fails
+            pinecone_connector_id = None
+            if namespace:
+                try:
+                    pinecone_connectors = get_pinecone_connectors(client)
+                    if pinecone_connectors:
+                        pinecone_connector_id = pinecone_connectors[0].id
+                except Exception as e:
+                    logger.warning(f"Could not get Pinecone connector: {e}")
+            
+            workflow_result = trigger_workflow(
+                client, 
+                workflow_id, 
+                namespace=namespace,
+                pinecone_connector_id=pinecone_connector_id
+            )
+            job_id = workflow_result.get('job_id') if workflow_result.get('success') else None
         else:
-            logger.info("No namespace provided, using default Pinecone namespace")
-        
-        # Trigger workflow
-        workflow_result = trigger_workflow(
-            client, 
-            workflow_id, 
-            namespace=namespace,  # Changed: Always pass namespace if provided
-            pinecone_connector_id=pinecone_connector_id
-        )
-        
-        job_id = None
-        if workflow_result.get('success') and 'job_id' in workflow_result:
-            job_id = workflow_result['job_id']
-            logger.info(f"Workflow triggered successfully with job ID: {job_id}")
-        elif workflow_result.get('success'):
-            logger.info("Workflow triggered successfully (no job ID returned)")
-        else:
-            logger.error(f"Workflow trigger failed: {workflow_result.get('error', 'Unknown error')}")
-        
-        # Optionally add to queue for monitoring (this is now secondary)
-        try:
-            add_job_to_queue(job_data)
-            logger.info(f"Job also added to monitoring queue for {file.filename}")
-        except Exception as e:
-            logger.warning(f"Could not add job to queue (not critical): {e}")
+            logger.info(f"✅ Job added to queue successfully, will be processed by Pub/Sub consumer")
+            job_id = "queued"  # Indicate job is queued
         
         # Log final response details
         logger.info(f"\n=== UPLOAD RESPONSE ===")
@@ -1968,9 +2144,327 @@ async def general_exception_handler(request, exc):
         ).dict()
     )
 
+# def process_batch_workflow(client, gcs_client, jobs_batch: List[Dict[str, Any]]) -> bool:
+    """
+    Process a batch of jobs together:
+    1. Copy all files to dev/unstructured.io/
+    2. Trigger workflow once for all files
+    """
+    global current_job_id, current_job_lock
+    
+    try:
+        logger.info(f"=== Processing Batch of {len(jobs_batch)} Jobs ===")
+        
+        # Get workflow and namespace from first job (assuming all use same workflow)
+        first_job = jobs_batch[0]
+        workflow_id = first_job['workflow_id']
+        namespace = first_job.get('namespace')
+        bucket_name = first_job.get('bucket')
+        
+        # Get Pinecone connector if namespace provided
+        pinecone_connector_id = None
+        if namespace:
+            try:
+                pinecone_connectors = get_pinecone_connectors(client)
+                if pinecone_connectors:
+                    pinecone_connector_id = pinecone_connectors[0].id
+                    logger.info(f"Using Pinecone connector: {pinecone_connector_id}")
+            except Exception as e:
+                logger.warning(f"Could not get Pinecone connector: {e}")
+        
+        # Copy all files to dev/unstructured.io/
+        logger.info(f"Copying {len(jobs_batch)} files to dev/unstructured.io/")
+        copied_files = []
+        failed_files = []
+        
+        for job_data in jobs_batch:
+            filename = job_data['filename']
+            source_path = job_data['gcs_path']
+            target_path = f"dev/unstructured.io/{filename}"
+            
+            logger.info(f"  Copying: {filename}")
+            copy_result = copy_file_in_gcs(gcs_client, bucket_name, source_path, target_path)
+            
+            if copy_result.get('success'):
+                copied_files.append(filename)
+                logger.info(f"  ✅ Copied: {filename}")
+            else:
+                failed_files.append(filename)
+                logger.error(f"  ❌ Failed to copy: {filename}")
+        
+        if not copied_files:
+            logger.error("No files were copied successfully")
+            return False
+        
+        logger.info(f"✅ Successfully copied {len(copied_files)}/{len(jobs_batch)} files")
+        if failed_files:
+            logger.warning(f"⚠️ Failed to copy {len(failed_files)} files: {failed_files}")
+        
+        # Trigger workflow once for all files in dev/unstructured.io/
+        logger.info(f"Triggering workflow for {len(copied_files)} files in dev/unstructured.io/")
+        workflow_result = trigger_workflow(
+            client,
+            workflow_id,
+            namespace=namespace,
+            pinecone_connector_id=pinecone_connector_id
+        )
+        
+        if not workflow_result.get('success'):
+            logger.error("Workflow trigger failed")
+            return False
+        
+        # Track the job ID
+        job_id = workflow_result.get('job_id')
+        if job_id:
+            with current_job_lock:
+                current_job_id = job_id
+            logger.info(f"✅ Workflow triggered with job_id: {job_id}")
+        else:
+            logger.info("✅ Workflow triggered successfully")
+        
+        logger.info(f"=== Batch Processing Completed: {len(copied_files)} files ===")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error in batch workflow processing: {e}")
+        logger.error(traceback.format_exc())
+        return False
+
+def process_batch_workflow(client, gcs_client, jobs_batch: List[Dict[str, Any]]) -> bool:
+    """
+    Process a batch of jobs, grouping by namespace:
+    1. Group jobs by namespace
+    2. For each namespace group:
+       - Copy files to dev/unstructured.io/
+       - Update Pinecone connector with namespace
+       - Trigger workflow for those files
+    3. Process all namespace groups sequentially
+    """
+    global current_job_id, current_job_lock
+    
+    
+    try:
+        logger.info(f"=== Processing Batch of {len(jobs_batch)} Jobs ===")
+        
+        # Group jobs by namespace
+        jobs_by_namespace = {}
+        for job_data in jobs_batch:
+            namespace = job_data.get('namespace') or 'default'  # Use 'default' for None
+            if namespace not in jobs_by_namespace:
+                jobs_by_namespace[namespace] = []
+            jobs_by_namespace[namespace].append(job_data)
+        
+        logger.info(f"📊 Jobs grouped into {len(jobs_by_namespace)} namespace(s): {list(jobs_by_namespace.keys())}")
+        
+        # Get Pinecone connector (same for all namespaces)
+        pinecone_connector_id = None
+        try:
+            pinecone_connectors = get_pinecone_connectors(client)
+            if pinecone_connectors:
+                pinecone_connector_id = pinecone_connectors[0].id
+                logger.info(f"Using Pinecone connector: {pinecone_connector_id}")
+        except Exception as e:
+            logger.warning(f"Could not get Pinecone connector: {e}")
+        
+        # Get workflow_id from first job (assuming all use same workflow)
+        workflow_id = jobs_batch[0]['workflow_id']
+        bucket_name = jobs_batch[0].get('bucket')
+        
+        overall_success = True
+        total_processed = 0
+        
+        # Process each namespace group separately
+        for namespace, namespace_jobs in jobs_by_namespace.items():
+            logger.info(f"\n{'='*60}")
+            logger.info(f"📦 Processing {len(namespace_jobs)} jobs for namespace: '{namespace}'")
+            logger.info(f"{'='*60}")
+            
+            # Copy files for this namespace to dev/unstructured.io/
+            logger.info(f"Copying {len(namespace_jobs)} files to dev/unstructured.io/")
+            copied_files = []
+            failed_files = []
+            
+            for job_data in namespace_jobs:
+                filename = job_data['filename']
+                source_path = job_data['gcs_path']
+                target_path = f"dev/unstructured.io/{filename}"
+                
+                logger.info(f"  Copying: {filename} (namespace: '{namespace}')")
+                copy_result = copy_file_in_gcs(gcs_client, bucket_name, source_path, target_path)
+                
+                if copy_result.get('success'):
+                    copied_files.append(filename)
+                    logger.info(f"  ✅ Copied: {filename}")
+                else:
+                    failed_files.append(filename)
+                    logger.error(f"  ❌ Failed to copy: {filename}")
+            
+            if not copied_files:
+                logger.error(f"No files were copied successfully for namespace '{namespace}'")
+                overall_success = False
+                continue
+            
+            logger.info(f"✅ Successfully copied {len(copied_files)}/{len(namespace_jobs)} files for namespace '{namespace}'")
+            if failed_files:
+                logger.warning(f"⚠️ Failed to copy {len(failed_files)} files: {failed_files}")
+            
+            # Update namespace if provided (skip if 'default' and no namespace was originally set)
+            actual_namespace = None if namespace == 'default' and not any(j.get('namespace') for j in namespace_jobs) else namespace
+            
+            # Trigger workflow for this namespace group
+            logger.info(f"Triggering workflow for {len(copied_files)} files in namespace '{actual_namespace or 'default'}'")
+            workflow_result = trigger_workflow(
+                client,
+                workflow_id,
+                namespace=actual_namespace if actual_namespace != 'default' else None,
+                pinecone_connector_id=pinecone_connector_id
+            )
+            
+            if not workflow_result.get('success'):
+                logger.error(f"Workflow trigger failed for namespace '{actual_namespace or 'default'}'")
+                overall_success = False
+                continue
+            
+            # Track the job ID
+            job_id = workflow_result.get('job_id')
+            if job_id:
+                with current_job_lock:
+                    current_job_id = job_id
+                logger.info(f"✅ Workflow triggered with job_id: {job_id} for namespace '{actual_namespace or 'default'}'")
+            else:
+                logger.info(f"✅ Workflow triggered successfully for namespace '{actual_namespace or 'default'}'")
+            
+            total_processed += len(copied_files)
+            
+            # Wait for workflow to complete before processing next namespace
+            logger.info(f"Waiting for workflow to complete before processing next namespace...")
+            if is_job_running(client):
+                wait_for_current_workflow(client)
+                logger.info(f"✅ Workflow completed for namespace '{actual_namespace or 'default'}'")
+        
+        logger.info(f"\n{'='*60}")
+        logger.info(f"=== Batch Processing Completed: {total_processed} files across {len(jobs_by_namespace)} namespace(s) ===")
+        logger.info(f"{'='*60}\n")
+        
+        return overall_success
+        
+    except Exception as e:
+        logger.error(f"Error in batch workflow processing: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
+
+def pubsub_consumer():
+    """Pub/Sub consumer that processes jobs in batches after workflow completes"""
+    logger.info("Starting Pub/Sub batch consumer...")
+    
+    while True:
+        try:
+            # Get subscriber client
+            if PUBSUB_CREDENTIALS_BASE64:
+                credentials_json = base64.b64decode(PUBSUB_CREDENTIALS_BASE64).decode('utf-8')
+                credentials_info = json.loads(credentials_json)
+                credentials = service_account.Credentials.from_service_account_info(credentials_info)
+                subscriber = pubsub_v1.SubscriberClient(credentials=credentials)
+            elif PUBSUB_CREDENTIALS_PATH and os.path.exists(PUBSUB_CREDENTIALS_PATH):
+                credentials = service_account.Credentials.from_service_account_file(PUBSUB_CREDENTIALS_PATH)
+                subscriber = pubsub_v1.SubscriberClient(credentials=credentials)
+            else:
+                subscriber = pubsub_v1.SubscriberClient()
+            
+            subscription_path = subscriber.subscription_path(PUBSUB_PROJECT_ID, PUBSUB_SUBSCRIPTION)
+            logger.info(f"Pub/Sub batch consumer listening on: {subscription_path}")
+            
+            # Get clients
+            client = get_unstructured_client()
+            gcs_client = get_gcs_client()
+            
+            if not client or not gcs_client:
+                logger.error("Failed to initialize clients")
+                time.sleep(10)
+                continue
+            
+            while True:
+                # Wait for any currently running workflow to finish
+                if is_job_running(client):
+                    logger.info("Workflow is currently running, waiting for completion...")
+                    wait_for_current_workflow(client)
+                    logger.info("✅ Workflow completed, ready to process queued jobs")
+                
+                # Pull all available messages from the queue
+                logger.info("Pulling all messages from queue...")
+                
+                try:
+                    # Pull up to 100 messages at once
+                    response = subscriber.pull(
+                        request={
+                            "subscription": subscription_path,
+                            "max_messages": 100,
+                        },
+                        timeout=5.0
+                    )
+                    
+                    if not response.received_messages:
+                        logger.info("No messages in queue, waiting...")
+                        time.sleep(10)
+                        continue
+                    
+                    # Collect all job data
+                    jobs_batch = []
+                    ack_ids = []
+                    
+                    for received_message in response.received_messages:
+                        try:
+                            job_data = json.loads(received_message.message.data.decode('utf-8'))
+                            jobs_batch.append(job_data)
+                            ack_ids.append(received_message.ack_id)
+                            logger.info(f"  Queued: {job_data['filename']}")
+                        except Exception as e:
+                            logger.error(f"Error parsing message: {e}")
+                    
+                    if not jobs_batch:
+                        logger.warning("No valid messages in batch")
+                        time.sleep(5)
+                        continue
+                    
+                    logger.info(f"📦 Pulled {len(jobs_batch)} jobs from queue")
+                    
+                    # Process all jobs together
+                    if process_batch_workflow(client, gcs_client, jobs_batch):
+                        # ACK all messages on success
+                        subscriber.acknowledge(
+                            request={
+                                "subscription": subscription_path,
+                                "ack_ids": ack_ids
+                            }
+                        )
+                        logger.info(f"✅ Acknowledged {len(ack_ids)} messages")
+                        
+                        # Wait before checking queue again
+                        logger.info("Waiting 30 seconds before next batch...")
+                        time.sleep(30)
+                    else:
+                        # On failure, messages will be redelivered automatically
+                        logger.error(f"❌ Batch processing failed, messages will be redelivered")
+                        time.sleep(10)
+                        
+                except Exception as e:
+                    if "Deadline" in str(e) or "timeout" in str(e).lower():
+                        # Timeout is expected when queue is empty
+                        logger.debug("Pull timeout (queue empty)")
+                        time.sleep(5)
+                    else:
+                        logger.error(f"Error pulling messages: {e}")
+                        time.sleep(10)
+                
+        except Exception as e:
+            logger.error(f"Pub/Sub consumer error: {e}, retrying in 10 seconds...")
+            logger.error(traceback.format_exc())
+            time.sleep(10)
+
 @app.on_event("startup")
 async def startup_event():
-    """Log startup information"""
+    """Log startup information and start Pub/Sub consumer"""
     port = int(os.getenv("PORT", 8000))
     environment = "Cloud Run" if os.getenv("K_SERVICE") else "Local"
     logger.info("=" * 80)
@@ -1978,10 +2472,20 @@ async def startup_event():
     logger.info(f"   - Environment: {environment}")
     logger.info(f"   - Port: {port}")
     logger.info(f"   - WebSocket support: Enabled")
+    logger.info(f"   - Pub/Sub configured: {bool(PUBSUB_PROJECT_ID and PUBSUB_TOPIC)}")
     if os.getenv("K_SERVICE"):
         logger.info(f"   - Cloud Run Service: {os.getenv('K_SERVICE')}")
         logger.info(f"   - Cloud Run Revision: {os.getenv('K_REVISION')}")
     logger.info("=" * 80)
+    
+    # Start Pub/Sub consumer in background thread
+    if PUBSUB_PROJECT_ID and PUBSUB_TOPIC:
+        try:
+            consumer_thread = threading.Thread(target=pubsub_consumer, daemon=True)
+            consumer_thread.start()
+            logger.info("✅ Pub/Sub consumer thread started")
+        except Exception as e:
+            logger.error(f"Failed to start Pub/Sub consumer: {e}")
 
 if __name__ == "__main__":
     import uvicorn
